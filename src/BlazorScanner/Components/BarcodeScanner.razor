@@ -1,0 +1,142 @@
+@namespace BlazorScanner
+@implements IAsyncDisposable
+
+<div class="bscan @CssClass"
+     data-status="@_status.ToString().ToLowerInvariant()"
+     data-fill="@(Fill ? "contain" : "aspect")"
+     role="region"
+     aria-label="@AriaLabel"
+     @attributes="AdditionalAttributes">
+
+    <video id="@_videoElementId"
+           class="bscan__video"
+           data-mirrored="@(_mirrored ? "true" : "false")"
+           playsinline
+           muted
+           autoplay
+           aria-hidden="true"></video>
+
+    @if (ShowMask && !_region.IsFull)
+    {
+        <div class="bscan__mask" style="clip-path: @MaskClipPath()"></div>
+    }
+
+    @if (Overlay is not null)
+    {
+        @Overlay(this)
+    }
+    else if (ShowReticle)
+    {
+        <div class="bscan__reticle" style="@ReticleStyle()" aria-hidden="true">
+            <span class="bscan__corner bscan__corner--tl"></span>
+            <span class="bscan__corner bscan__corner--tr"></span>
+            <span class="bscan__corner bscan__corner--bl"></span>
+            <span class="bscan__corner bscan__corner--br"></span>
+        </div>
+    }
+
+    @if (HighlightResults && _highlight is not null)
+    {
+        <div class="bscan__hit" style="@_highlight" aria-hidden="true"></div>
+    }
+
+    @if (ShowStatusBar)
+    {
+        <div class="bscan__status">
+            <span class="bscan__dot" aria-hidden="true"></span>
+            <span>@StatusText()</span>
+        </div>
+    }
+
+    @if (_message is not null)
+    {
+        <div class="bscan__message @(_status == ScannerStatus.Faulted ? "bscan__message--error" : null)">
+            @if (MessageTemplate is not null)
+            {
+                @MessageTemplate(_message!)
+            }
+            else
+            {
+                @_message
+            }
+        </div>
+    }
+
+    @if (ShowControls)
+    {
+        <div class="bscan__controls">
+            @if (_status is ScannerStatus.Scanning or ScannerStatus.Paused)
+            {
+                <button type="button"
+                        class="bscan__button"
+                        aria-pressed="@(_status == ScannerStatus.Paused ? "true" : "false")"
+                        @onclick="TogglePauseAsync">
+                    @(_status == ScannerStatus.Paused ? "Resume" : "Pause")
+                </button>
+                <button type="button" class="bscan__button" @onclick="StopAsync">Stop</button>
+            }
+            else
+            {
+                <button type="button" class="bscan__button" @onclick="() => StartAsync()">Start</button>
+            }
+
+            @if (_cameras.Count > 1)
+            {
+                <select class="bscan__select"
+                        aria-label="Camera"
+                        value="@_activeDeviceId"
+                        @onchange="OnCameraSelectedAsync">
+                    @foreach (var camera in _cameras)
+                    {
+                        <option value="@camera.DeviceId">@camera.Label</option>
+                    }
+                </select>
+            }
+
+            @if (_camera?.SupportsTorch == true)
+            {
+                <button type="button"
+                        class="bscan__button"
+                        aria-pressed="@(_torchOn ? "true" : "false")"
+                        aria-label="Torch"
+                        @onclick="ToggleTorchAsync">
+                    Torch
+                </button>
+            }
+
+            @if (_camera?.SupportsZoom == true && _camera.ZoomMax > _camera.ZoomMin)
+            {
+                <input class="bscan__range"
+                       type="range"
+                       aria-label="Zoom"
+                       min="@_camera.ZoomMin"
+                       max="@_camera.ZoomMax"
+                       step="@(_camera.ZoomStep > 0 ? _camera.ZoomStep : 0.1)"
+                       value="@_zoom"
+                       @onchange="OnZoomChangedAsync" />
+            }
+
+            @if (EnableFileScanning)
+            {
+                <button type="button" class="bscan__button" @onclick="OpenFilePickerAsync">Scan image</button>
+            }
+
+            @ControlsContent
+        </div>
+    }
+
+    @if (EnableFileScanning)
+    {
+        <input id="@_fileInputId"
+               class="bscan__file"
+               type="file"
+               accept="image/*"
+               tabindex="-1"
+               aria-hidden="true"
+               @onchange="OnFileSelectedAsync" />
+    }
+
+    <div class="bscan__sr" role="status" aria-live="polite">@_announcement</div>
+
+    @ChildContent
+</div>
