@@ -1,0 +1,84 @@
+@page "/image"
+
+<PageTitle>Image scanning · BlazorBarcodeScanner</PageTitle>
+
+<h1>Image and file scanning</h1>
+<p class="lede">
+    The same decoder reads a still image. Nothing about the pipeline changes; only the tuning
+    does, because a one-shot decode can afford to be exhaustive.
+</p>
+
+<div class="split">
+    <div class="stack">
+        <BarcodeScanner @ref="_scanner"
+                        AutoStart="false"
+                        ShowStatusBar="true"
+                        Formats="BarcodeFormat.All"
+                        EnableFileScanning="true"
+                        OnScan="HandleScan"
+                        OnError="e => _error = e" />
+
+        <div class="card">
+            <h3 style="margin-block-start:0;">Pick an image</h3>
+            <p class="field__hint">
+                The component ships a hidden file input and the plumbing to read it. Opening it
+                from your own button is a single call.
+            </p>
+            <div class="button-row">
+                <button class="button button--primary" type="button" @onclick="OpenPicker">Choose an image</button>
+                <button class="button" type="button" @onclick="() => _results.Clear()" disabled="@(_results.Count == 0)">Clear</button>
+            </div>
+        </div>
+
+        @if (_error is not null)
+        {
+            <div class="note note--warning"><strong>@_error.Kind</strong> — @_error.Message</div>
+        }
+    </div>
+
+    <div class="stack">
+        <div class="card">
+            <h3 style="margin-block-start:0;">Why still images differ</h3>
+            <p style="font-size:0.9rem;color:var(--fg-muted);">
+                A camera gets another chance in fifty milliseconds, so a live frame should give up
+                early. A file gets one chance, so
+                <code>ScannerOptions.ForStillImages()</code> raises the scan line count, enables the
+                exhaustive detector path and allows inverted symbols.
+            </p>
+            <pre><code>var options = ScannerOptions.ForStillImages();
+options.Formats = BarcodeFormat.QrCode;
+
+using var decoder = new BarcodeDecoder(options);
+var result = decoder.Decode(pixels, width, height, PixelFormat.Rgba32);</code></pre>
+        </div>
+
+        <div class="card">
+            <h3 style="margin-block-start:0;">Large photographs</h3>
+            <p style="font-size:0.9rem;color:var(--fg-muted);margin:0;">
+                A twelve megapixel photo carries no more barcode detail than a two megapixel one,
+                so the component asks the browser to scale anything larger than 1600 pixels on its
+                longest edge before it crosses into managed code. That alone is the difference
+                between a snappy decode and a visible pause on a phone.
+            </p>
+        </div>
+    </div>
+</div>
+
+<div style="margin-block-start:1.25rem;">
+    <ResultLog Results="_results" OnClear="() => _results.Clear()" />
+</div>
+
+@code {
+    private readonly List<BarcodeResult> _results = [];
+    private BarcodeScanner? _scanner;
+    private ScannerException? _error;
+
+    private Task OpenPicker() => _scanner is null ? Task.CompletedTask : _scanner.OpenFilePickerAsync();
+
+    private void HandleScan(BarcodeResult result)
+    {
+        _error = null;
+        _results.Insert(0, result);
+        StateHasChanged();
+    }
+}

@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+
+  <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <PackageId>BlazorBarcodeScanner</PackageId>
+    <Description>A dependency-free, high performance barcode scanner for Blazor. Decoding is implemented entirely in C#.</Description>
+    <PackageTags>blazor;barcode;qrcode;scanner;datamatrix;pdf417;ean;upc;code128</PackageTags>
+    <RootNamespace>BlazorBarcodeScanner</RootNamespace>
+    <IsTrimmable>true</IsTrimmable>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <SupportedPlatform Include="browser" />
+    <PackageReference Include="Microsoft.AspNetCore.Components.Web" Version="10.0.0" />
+  </ItemGroup>
+
+</Project>

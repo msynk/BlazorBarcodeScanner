@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="BlazorBarcodeScanner/BlazorBarcodeScanner.csproj" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="BlazorBarcodeScanner.Demo/BlazorBarcodeScanner.Demo.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/BlazorBarcodeScanner.Benchmarks/BlazorBarcodeScanner.Benchmarks.csproj" />
+    <Project Path="tests/BlazorBarcodeScanner.TestKit/BlazorBarcodeScanner.TestKit.csproj" />
+    <Project Path="tests/BlazorBarcodeScanner.Tests/BlazorBarcodeScanner.Tests.csproj" />
+  </Folder>
+</Solution>

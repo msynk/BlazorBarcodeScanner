@@ -1,4 +1,4 @@
-# BlazorScanner
+# BlazorBarcodeScanner
 
 A barcode scanner for Blazor with the decoding written from scratch in C#.
 
@@ -48,13 +48,13 @@ correction and bit stream parsing — is managed code you can step into.
 ## Installing
 
 ```bash
-dotnet add package BlazorScanner
+dotnet add package BlazorBarcodeScanner
 ```
 
 Reference the stylesheet from `index.html`:
 
 ```html
-<link rel="stylesheet" href="_content/BlazorScanner/blazor-scanner.css" />
+<link rel="stylesheet" href="_content/BlazorBarcodeScanner/blazor-barcode-scanner.css" />
 ```
 
 That is the whole setup. There is no service registration, no script tag and no initialisation
@@ -150,7 +150,7 @@ restyles the scanner without overriding a single selector:
 }
 ```
 
-The full list is in [`blazor-scanner.css`](src/BlazorScanner/wwwroot/blazor-scanner.css) and on the
+The full list is in [`blazor-barcode-scanner.css`](src/BlazorBarcodeScanner/wwwroot/blazor-barcode-scanner.css) and on the
 demo's customisation page.
 
 The component is a labelled region, the controls are real buttons with pressed state, results are
@@ -224,7 +224,7 @@ What costs what:
 Run them yourself:
 
 ```bash
-dotnet run -c Release --project bench/BlazorScanner.Benchmarks -- --filter '*DecoderBenchmarks*'
+dotnet run -c Release --project src/tests/BlazorBarcodeScanner.Benchmarks -- --filter '*DecoderBenchmarks*'
 ```
 
 The benchmark host verifies that every frame still decodes before taking any timing, because a
@@ -256,11 +256,11 @@ Layers, and where they live:
 
 | Layer | Namespace | Responsibility |
 | --- | --- | --- |
-| Component | `BlazorScanner` | Parameters, rendering, lifecycle, overlays |
-| Interop | `BlazorScanner.Interop` | The complete JavaScript surface, all `JSImport` |
-| Orchestration | `BlazorScanner.Pipeline` | Frame budget, scratch state, duplicate suppression, diagnostics |
-| Imaging | `BlazorScanner.Imaging` | Luminance planes, bit planes, binarisers |
-| Decoding | `BlazorScanner.Decoding.*` | One namespace per symbology, plus shared algorithms |
+| Component | `BlazorBarcodeScanner` | Parameters, rendering, lifecycle, overlays |
+| Interop | `BlazorBarcodeScanner.Interop` | The complete JavaScript surface, all `JSImport` |
+| Orchestration | `BlazorBarcodeScanner.Pipeline` | Frame budget, scratch state, duplicate suppression, diagnostics |
+| Imaging | `BlazorBarcodeScanner.Imaging` | Luminance planes, bit planes, binarisers |
+| Decoding | `BlazorBarcodeScanner.Decoding.*` | One namespace per symbology, plus shared algorithms |
 
 Design decisions worth knowing about:
 
@@ -318,11 +318,11 @@ starting with a bar.
 ## Repository layout
 
 ```
-src/BlazorScanner            the library
-tests/BlazorScanner.TestKit  encoders and image helpers, shared by tests, benchmarks and the demo
-tests/BlazorScanner.Tests    unit and round-trip tests
-bench/BlazorScanner.Benchmarks  BenchmarkDotNet suites
-samples/BlazorScanner.Demo   documentation site and reference implementation
+src/BlazorBarcodeScanner                     the library
+src/BlazorBarcodeScanner.Demo                documentation site and reference implementation
+src/tests/BlazorBarcodeScanner.TestKit       encoders and image helpers, shared by tests, benchmarks and the demo
+src/tests/BlazorBarcodeScanner.Tests         unit and round-trip tests
+src/tests/BlazorBarcodeScanner.Benchmarks    BenchmarkDotNet suites
 ```
 
 The encoders live in the test kit, not in the library: the library only reads barcodes. They exist
@@ -332,9 +332,9 @@ demo can render real, scannable symbols.
 ## Building and testing
 
 ```bash
-dotnet build
-dotnet test
-dotnet run --project samples/BlazorScanner.Demo
+dotnet build src/BlazorBarcodeScanner.slnx
+dotnet test src/BlazorBarcodeScanner.slnx
+dotnet run --project src/BlazorBarcodeScanner.Demo
 ```
 
 The demo doubles as the documentation site: a live playground for every parameter, generated
