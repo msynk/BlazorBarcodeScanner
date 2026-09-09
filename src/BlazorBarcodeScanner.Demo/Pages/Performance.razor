@@ -78,6 +78,10 @@
                             {
                                 <span class="pill pill--success">yes</span>
                             }
+                            else if (row.ExpectedFound)
+                            {
+                                <span class="pill pill--danger">not found</span>
+                            }
                             else
                             {
                                 <span class="pill pill--muted">empty frame</span>
@@ -93,7 +97,8 @@
 <h2>Live camera cost</h2>
 <div class="split">
     <div>
-        <BarcodeScanner Formats="_liveFormats"
+        <BarcodeScanner @ref="_scanner"
+                        Formats="_liveFormats"
                         TargetFrameRate="_frameRate"
                         MaxProcessingSize="_processingSize"
                         Region="_region"
@@ -101,7 +106,9 @@
                         OnDiagnostics="OnDiagnostics" />
     </div>
     <div class="stack">
-        <DiagnosticsPanel Diagnostics="_diagnostics" FramesDecoded="_frames" FramesWithSymbol="_hits" />
+        <DiagnosticsPanel Diagnostics="_diagnostics"
+                          FramesDecoded="_scanner?.FramesDecoded ?? 0"
+                          FramesWithSymbol="_scanner?.FramesWithSymbol ?? 0" />
 
         <div class="card">
             <h3 style="margin-block-start:0;">Knobs</h3>
@@ -183,13 +190,12 @@
 </table>
 
 @code {
-    private sealed record BenchmarkRow(string Name, double Median, double Best, double Worst, bool Found);
+    private sealed record BenchmarkRow(string Name, double Median, double Best, double Worst, bool Found, bool ExpectedFound);
 
     private readonly List<BenchmarkRow> _benchmarks = [];
 
     private ScanDiagnostics _diagnostics;
-    private long _frames;
-    private long _hits;
+    private BarcodeScanner? _scanner;
 
     private int _benchSize = 640;
     private int _iterations = 30;
@@ -205,11 +211,6 @@
     private void OnDiagnostics(ScanDiagnostics diagnostics)
     {
         _diagnostics = diagnostics;
-        _frames++;
-        if (diagnostics.Decoded)
-        {
-            _hits++;
-        }
 
         StateHasChanged();
     }
@@ -262,15 +263,22 @@
             timings[timings.Length / 2],
             timings[0],
             timings[^1],
-            expectFound && found);
+            found,
+            expectFound);
     }
 
-    /// <summary>Renders a sample into a full size grayscale frame, centred, as a camera would see it.</summary>
+    /// <summary>
+    /// Renders a sample into a full size grayscale frame, centred, as a camera would see it.
+    /// </summary>
+    /// <remarks>
+    /// The scale is chosen so the whole symbol fits: a symbol cropped by the edge of the frame
+    /// cannot decode, and timing the failure path would measure the wrong thing.
+    /// </remarks>
     private static byte[] BuildFrame(BarcodeSample sample, int width, int height)
     {
         using var symbol = sample.Matrix is not null
-            ? BlazorBarcodeScanner.TestKit.SyntheticImage.FromMatrix(sample.Matrix, scale: 4)
-            : BlazorBarcodeScanner.TestKit.SyntheticImage.FromLinear(sample.Modules!, scale: 2, height: 80);
+            ? BlazorBarcodeScanner.TestKit.SyntheticImage.FromMatrix(sample.Matrix, scale: MatrixScale(sample, width, height))
+            : BlazorBarcodeScanner.TestKit.SyntheticImage.FromLinear(sample.Modules!, scale: LinearScale(sample, width), height: 80);
 
         var frame = new byte[width * height];
         Array.Fill(frame, (byte)235);
@@ -287,6 +295,19 @@
         }
 
         return frame;
+    }
+
+    private static int MatrixScale(BarcodeSample sample, int width, int height)
+    {
+        var modules = sample.Matrix!.Width + 8;
+        var limit = Math.Min(width, height);
+        return Math.Clamp(limit / modules, 1, 4);
+    }
+
+    private static int LinearScale(BarcodeSample sample, int width)
+    {
+        var modules = sample.Modules!.Length + 24;
+        return Math.Clamp(width / modules, 1, 3);
     }
 
     private void OnRegionChanged(ChangeEventArgs args)

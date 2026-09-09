@@ -113,10 +113,23 @@ public sealed class ItfReader : IRowDecoder
         var digitPair = _digitPair;
         Span<int> black = stackalloc int[5];
         Span<int> white = stackalloc int[5];
+        var firstPairWidth = 0;
 
         while (payloadStart < payloadEnd)
         {
             if (!LinearPatterns.RecordPattern(row, payloadStart, digitPair))
+            {
+                return false;
+            }
+
+            // Every pair is the same number of modules wide, so a pair whose width drifts from
+            // the first one is a scan line leaving the symbol through its edge, not a digit.
+            var pairWidth = MathUtils.Sum(digitPair);
+            if (firstPairWidth == 0)
+            {
+                firstPairWidth = pairWidth;
+            }
+            else if (Math.Abs(pairWidth - firstPairWidth) * 4 > firstPairWidth)
             {
                 return false;
             }
@@ -146,7 +159,9 @@ public sealed class ItfReader : IRowDecoder
             }
         }
 
-        return true;
+        // The last pair has to end exactly where the end pattern begins; anything else means the
+        // runs in between were not digit pairs at all.
+        return payloadStart == payloadEnd;
     }
 
     private static bool TryDecodeDigit(ReadOnlySpan<int> counters, out int digit)
@@ -225,6 +240,13 @@ public sealed class ItfReader : IRowDecoder
                 return false;
             }
 
+            // The end pattern's narrow elements must agree with the start pattern's module width.
+            var endNarrow = (_guardCounters[0] + _guardCounters[1]) / 2.0f;
+            if (Math.Abs(endNarrow - _narrowLineWidth) > Math.Max(1.0f, _narrowLineWidth * 0.5f))
+            {
+                return false;
+            }
+
             endBegin = row.Size - end;
             return true;
         }
@@ -241,7 +263,13 @@ public sealed class ItfReader : IRowDecoder
     private bool ValidateQuietZone(BitRow row, int startPattern)
     {
         var quietCount = _narrowLineWidth * 10;
-        quietCount = Math.Min(quietCount, startPattern);
+
+        // A symbol cut off by the edge of the frame has no quiet zone to check, and reading it
+        // anyway is how ITF produces its notorious truncated values.
+        if (startPattern < quietCount)
+        {
+            return false;
+        }
 
         for (var i = startPattern - 1; quietCount > 0 && i >= 0; i--)
         {

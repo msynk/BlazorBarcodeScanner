@@ -11,11 +11,18 @@ const state = {
     sessions: new Map(),
 };
 
+/** grabFrame result: the camera track has ended (unplugged, revoked, or taken by another app). */
+const FRAME_TRACK_ENDED = -2;
+
+/** grabFrame result: the supplied buffer is too small for a frame. */
+const FRAME_BUFFER_TOO_SMALL = -1;
+
 function getSession(id) {
     let session = state.sessions.get(id);
     if (!session) {
         session = {
             id,
+            generation: 0,
             stream: null,
             track: null,
             video: null,
@@ -24,7 +31,16 @@ function getSession(id) {
             canvasWidth: 0,
             canvasHeight: 0,
             hasNewFrame: false,
+            usesFrameCallback: false,
+            trackEnded: false,
             frameCallbackHandle: 0,
+            onTrackEnded: null,
+            onVideoResize: null,
+            resizeObserver: null,
+            viewWidth: 0,
+            viewHeight: 0,
+            videoSizeVersion: 0,
+            viewSizeVersion: 0,
             prepared: null,
         };
         state.sessions.set(id, session);
@@ -33,26 +49,56 @@ function getSession(id) {
     return session;
 }
 
+function stopTracks(stream) {
+    if (!stream) {
+        return;
+    }
+
+    for (const track of stream.getTracks()) {
+        try {
+            track.stop();
+        } catch {
+            // A track that is already ended throws in some browsers; there is nothing to release.
+        }
+    }
+}
+
 function releaseStream(session) {
+    // Any start() still in flight for this session must not attach its stream when it resolves.
+    session.generation++;
+
     if (session.frameCallbackHandle && session.video && session.video.cancelVideoFrameCallback) {
         session.video.cancelVideoFrameCallback(session.frameCallbackHandle);
     }
 
     session.frameCallbackHandle = 0;
 
-    if (session.stream) {
-        for (const track of session.stream.getTracks()) {
-            track.stop();
-        }
+    if (session.track && session.onTrackEnded) {
+        session.track.removeEventListener('ended', session.onTrackEnded);
     }
+
+    session.onTrackEnded = null;
+    if (session.resizeObserver) {
+        session.resizeObserver.disconnect();
+        session.resizeObserver = null;
+    }
+
+    stopTracks(session.stream);
 
     if (session.video) {
         session.video.srcObject = null;
     }
 
+    if (session.video && session.onVideoResize) {
+        session.video.removeEventListener('resize', session.onVideoResize);
+    }
+
+    session.onVideoResize = null;
     session.stream = null;
     session.track = null;
     session.hasNewFrame = false;
+    session.usesFrameCallback = false;
+    session.trackEnded = false;
 }
 
 function ensureCanvas(session, width, height) {
@@ -88,13 +134,22 @@ function scheduleFrameCallback(session) {
     }
 
     if (typeof video.requestVideoFrameCallback !== 'function') {
-        // Without the callback there is no way to tell new frames from repeats, so every grab
-        // is treated as new. The managed side still paces itself with its own timer.
+        // Firefox and older Safari have no way to tell a new frame from a repeat, so every grab
+        // is treated as new and the managed side's timer alone paces the scan. The flag must
+        // therefore stay set: clearing it after a grab, as the callback path does, would stop
+        // the scanner dead after its very first frame.
+        session.usesFrameCallback = false;
         session.hasNewFrame = true;
         return;
     }
 
+    session.usesFrameCallback = true;
+    const generation = session.generation;
     const step = () => {
+        if (session.generation !== generation) {
+            return;
+        }
+
         session.hasNewFrame = true;
         session.frameCallbackHandle = video.requestVideoFrameCallback(step);
     };
@@ -106,11 +161,16 @@ function describeTrack(track, video) {
     const settings = typeof track.getSettings === 'function' ? track.getSettings() : {};
     const capabilities = typeof track.getCapabilities === 'function' ? track.getCapabilities() : {};
 
+    // The <video> element reports the frames as they are actually delivered, which is what the
+    // canvas copies; the track settings can lag or be swapped on rotated mobile cameras.
+    const width = video.videoWidth || settings.width || 0;
+    const height = video.videoHeight || settings.height || 0;
+
     return {
         deviceId: settings.deviceId ?? '',
         label: track.label ?? '',
-        width: settings.width ?? video.videoWidth ?? 0,
-        height: settings.height ?? video.videoHeight ?? 0,
+        width,
+        height,
         frameRate: settings.frameRate ?? 0,
         facingMode: settings.facingMode ?? '',
         supportsTorch: Object.prototype.hasOwnProperty.call(capabilities, 'torch'),
@@ -123,6 +183,27 @@ function describeTrack(track, video) {
     };
 }
 
+function waitForVideoSize(video, timeoutMs) {
+    if (video.videoWidth) {
+        return Promise.resolve();
+    }
+
+    // Safari reports a zero sized video until metadata has actually arrived.
+    return new Promise(resolve => {
+        let timer = 0;
+        const done = () => {
+            clearTimeout(timer);
+            video.removeEventListener('loadedmetadata', done);
+            video.removeEventListener('resize', done);
+            resolve();
+        };
+
+        video.addEventListener('loadedmetadata', done);
+        video.addEventListener('resize', done);
+        timer = setTimeout(done, timeoutMs);
+    });
+}
+
 /**
  * Returns the available video inputs as JSON. Labels are only populated once the user has
  * granted camera permission at least once, which is a browser privacy rule, not a bug.
@@ -133,12 +214,28 @@ export async function listCameras() {
     }
 
     const devices = await navigator.mediaDevices.enumerateDevices();
-    const cameras = devices
-        .filter(d => d.kind === 'videoinput')
-        .map((d, index) => ({
-            deviceId: d.deviceId,
-            label: d.label || `Camera ${index + 1}`,
-        }));
+    const cameras = [];
+    const seen = new Set();
+    let index = 0;
+    for (const device of devices) {
+        if (device.kind !== 'videoinput') {
+            continue;
+        }
+
+        index++;
+
+        // Before permission is granted every device reports an empty id; one placeholder entry
+        // is enough to say "a camera exists".
+        if (seen.has(device.deviceId)) {
+            continue;
+        }
+
+        seen.add(device.deviceId);
+        cameras.push({
+            deviceId: device.deviceId,
+            label: device.label || `Camera ${index}`,
+        });
+    }
 
     return JSON.stringify(cameras);
 }
@@ -146,10 +243,15 @@ export async function listCameras() {
 /**
  * Opens a camera and binds it to the <video> element with the given id.
  * Returns a JSON description of the negotiated track.
+ *
+ * A second start on the same session, or a stop or dispose, supersedes a start still waiting
+ * for the permission prompt: when the older one resolves its stream is closed again and it
+ * rejects with AbortError, so a camera can never be left running by a request nobody wants.
  */
 export async function start(sessionId, videoElementId, deviceId, requestedWidth, requestedHeight, facingMode) {
     const session = getSession(sessionId);
     releaseStream(session);
+    const generation = session.generation;
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         throw new Error('NotSupportedError: this browser exposes no camera API.');
@@ -160,22 +262,28 @@ export async function start(sessionId, videoElementId, deviceId, requestedWidth,
         throw new Error('NotFoundError: the scanner video element is not in the document.');
     }
 
-    const video_constraints = {};
+    const videoConstraints = {};
     if (deviceId) {
-        video_constraints.deviceId = { exact: deviceId };
+        videoConstraints.deviceId = { exact: deviceId };
     } else if (facingMode) {
-        video_constraints.facingMode = { ideal: facingMode };
+        videoConstraints.facingMode = { ideal: facingMode };
     }
 
     if (requestedWidth > 0) {
-        video_constraints.width = { ideal: requestedWidth };
+        videoConstraints.width = { ideal: requestedWidth };
     }
 
     if (requestedHeight > 0) {
-        video_constraints.height = { ideal: requestedHeight };
+        videoConstraints.height = { ideal: requestedHeight };
     }
 
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: video_constraints });
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints });
+
+    const superseded = () => session.generation !== generation || state.sessions.get(sessionId) !== session;
+    if (superseded()) {
+        stopTracks(stream);
+        throw new Error('AbortError: the camera request was superseded.');
+    }
 
     session.stream = stream;
     session.video = video;
@@ -184,25 +292,86 @@ export async function start(sessionId, videoElementId, deviceId, requestedWidth,
     video.muted = true;
     video.srcObject = stream;
 
-    await video.play();
+    try {
+        await video.play();
+        await waitForVideoSize(video, 2000);
+    } catch (error) {
+        if (!superseded()) {
+            releaseStream(session);
+        }
 
-    // Safari reports a zero sized video until metadata has actually arrived.
-    if (!video.videoWidth) {
-        await new Promise(resolve => {
-            const done = () => {
-                video.removeEventListener('loadedmetadata', done);
-                resolve();
-            };
+        throw error;
+    }
 
-            video.addEventListener('loadedmetadata', done);
-            setTimeout(done, 2000);
-        });
+    if (superseded()) {
+        // releaseStream already closed the stream; make sure of it in case a newer start
+        // replaced the session object outright.
+        stopTracks(stream);
+        throw new Error('AbortError: the camera request was superseded.');
     }
 
     session.track = stream.getVideoTracks()[0];
+    session.trackEnded = false;
+    session.onTrackEnded = () => {
+        session.trackEnded = true;
+    };
+    session.track.addEventListener('ended', session.onTrackEnded);
+
+    session.onVideoResize = () => {
+        session.videoSizeVersion = (session.videoSizeVersion + 1) & 0xFF;
+    };
+
+    video.addEventListener('resize', session.onVideoResize);
+
     scheduleFrameCallback(session);
+    observeViewSize(session, video);
 
     return JSON.stringify(describeTrack(session.track, video));
+}
+
+function observeViewSize(session, video) {
+    session.viewWidth = video.clientWidth;
+    session.viewHeight = video.clientHeight;
+    if (typeof ResizeObserver !== 'function') {
+        return;
+    }
+
+    session.resizeObserver = new ResizeObserver(() => {
+        session.viewWidth = video.clientWidth;
+        session.viewHeight = video.clientHeight;
+        session.viewSizeVersion = (session.viewSizeVersion + 1) & 0xFF;
+    });
+    session.resizeObserver.observe(video);
+}
+
+/**
+ * Returns a token that changes whenever the camera renegotiates its resolution or the video
+ * element is resized. The managed side polls it once per frame and recomputes only what
+ * actually changed, which is far cheaper than pushing an event across the boundary.
+ */
+export function pollChanges(sessionId) {
+    const session = state.sessions.get(sessionId);
+    if (!session) {
+        return 0;
+    }
+
+    return (session.videoSizeVersion << 8) | session.viewSizeVersion;
+}
+
+/**
+ * Returns the rendered size of the video element packed as (width << 16) | height, so the
+ * managed side can map frame coordinates onto what is actually visible when the video is
+ * cropped to fill its box.
+ */
+export function getViewSize(sessionId) {
+    const session = state.sessions.get(sessionId);
+    if (!session || !session.video) {
+        return 0;
+    }
+
+    const width = Math.min(0x7FFF, Math.max(0, Math.round(session.viewWidth || session.video.clientWidth || 0)));
+    const height = Math.min(0xFFFF, Math.max(0, Math.round(session.viewHeight || session.video.clientHeight || 0)));
+    return (width << 16) | height;
 }
 
 /** Sets the resolution frames are sampled at. Lower is faster and is chosen by the managed side. */
@@ -213,12 +382,20 @@ export function configure(sessionId, width, height) {
 
 /**
  * Copies the most recent camera frame into a .NET buffer as RGBA.
- * Returns the number of bytes written, 0 when there is no new frame, or -1 when the buffer is
- * too small.
+ * Returns the number of bytes written, 0 when there is no new frame, -1 when the buffer is
+ * too small, or -2 when the camera track has ended.
  */
 export function grabFrame(sessionId, buffer) {
     const session = state.sessions.get(sessionId);
-    if (!session || !session.video || !session.ctx || !session.hasNewFrame) {
+    if (!session || !session.video || !session.ctx) {
+        return 0;
+    }
+
+    if (session.trackEnded || (session.track && session.track.readyState === 'ended')) {
+        return FRAME_TRACK_ENDED;
+    }
+
+    if (!session.hasNewFrame) {
         return 0;
     }
 
@@ -228,14 +405,19 @@ export function grabFrame(sessionId, buffer) {
         return 0;
     }
 
-    session.ctx.drawImage(session.video, 0, 0, width, height);
-    const data = session.ctx.getImageData(0, 0, width, height).data;
-    if (buffer.length < data.byteLength) {
-        return -1;
+    const required = width * height * 4;
+    if (buffer.length < required) {
+        return FRAME_BUFFER_TOO_SMALL;
     }
 
+    session.ctx.drawImage(session.video, 0, 0, width, height);
+    const data = session.ctx.getImageData(0, 0, width, height).data;
     buffer.set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
-    session.hasNewFrame = false;
+
+    if (session.usesFrameCallback) {
+        session.hasNewFrame = false;
+    }
+
     return data.byteLength;
 }
 
@@ -298,6 +480,7 @@ export function dispose(sessionId) {
     session.prepared = null;
     session.canvas = null;
     session.ctx = null;
+    session.video = null;
     state.sessions.delete(sessionId);
 }
 
@@ -312,22 +495,57 @@ export async function prepareImageFromInput(sessionId, inputElementId, maxDimens
         return 0;
     }
 
-    return await prepareImageFromBlob(sessionId, input.files[0], maxDimension);
+    const file = input.files[0];
+
+    // Clear the selection so that choosing the same file again raises another change event.
+    try {
+        input.value = '';
+    } catch {
+        // Older browsers refuse to reset a file input; the next selection of a different file
+        // still works.
+    }
+
+    return await prepareImageFromBlob(sessionId, file, maxDimension);
+}
+
+async function decodeBitmap(blob) {
+    try {
+        // Honour the EXIF orientation of photographs, which phones store rotated.
+        return await createImageBitmap(blob, { imageOrientation: 'from-image' });
+    } catch (error) {
+        if (error instanceof TypeError || (error && error.name === 'TypeError')) {
+            // The option is unsupported by this browser; fall back to the default orientation.
+            return await createImageBitmap(blob);
+        }
+
+        throw error;
+    }
 }
 
 /** Decodes an image blob the same way as prepareImageFromInput. */
 export async function prepareImageFromBlob(sessionId, blob, maxDimension) {
     const session = getSession(sessionId);
-    const bitmap = await createImageBitmap(blob);
+    const bitmap = await decodeBitmap(blob);
 
     try {
         let width = bitmap.width;
         let height = bitmap.height;
+        if (!width || !height) {
+            return 0;
+        }
+
         const longest = Math.max(width, height);
         if (maxDimension > 0 && longest > maxDimension) {
             const scale = maxDimension / longest;
             width = Math.max(1, Math.round(width * scale));
             height = Math.max(1, Math.round(height * scale));
+        }
+
+        // Dimensions travel packed into one positive integer, so the width gets fifteen bits.
+        if (width > 0x7FFF || height > 0xFFFF) {
+            const scale = 0x7FFF / Math.max(width, height);
+            width = Math.max(1, Math.floor(width * scale));
+            height = Math.max(1, Math.floor(height * scale));
         }
 
         const canvas = typeof OffscreenCanvas === 'function'
@@ -352,12 +570,16 @@ export function readPrepared(sessionId, buffer) {
     }
 
     const data = session.prepared;
+
+    // Released either way: a full resolution image is megabytes, and holding one alive because
+    // the caller mis-sized its buffer would be a leak for the life of the session.
+    session.prepared = null;
+
     if (buffer.length < data.byteLength) {
-        return -1;
+        return FRAME_BUFFER_TOO_SMALL;
     }
 
     buffer.set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
-    session.prepared = null;
     return data.byteLength;
 }
 

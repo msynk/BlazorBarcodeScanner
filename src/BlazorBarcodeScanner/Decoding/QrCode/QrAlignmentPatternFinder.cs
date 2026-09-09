@@ -117,9 +117,11 @@ public sealed class QrAlignmentPatternFinder
             }
         }
 
-        // Any candidate is better than none: a single unconfirmed sighting still improves the
-        // sampling grid over assuming no alignment pattern at all.
-        return _possibleCenters.Count > 0 ? _possibleCenters[0] : null;
+        // A single unconfirmed sighting is as likely to be an isolated data module as the real
+        // pattern, and a wrong alignment centre shears the entire grid. The detector copes with a
+        // missing pattern by falling back to the affine transform, so reporting nothing is
+        // strictly better than reporting a guess.
+        return null;
     }
 
     private static bool FoundPatternCross(ReadOnlySpan<int> stateCount, float moduleSize)

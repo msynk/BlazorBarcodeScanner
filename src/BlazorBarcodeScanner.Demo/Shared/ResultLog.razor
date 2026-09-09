@@ -18,6 +18,7 @@
     }
     else
     {
+        <div class="table-scroll">
         <table>
             <thead>
                 <tr>
@@ -31,16 +32,17 @@
             <tbody>
                 @foreach (var entry in Results)
                 {
-                    <tr>
+                    <tr data-testid="result-row">
                         <td style="white-space:nowrap;">@entry.Timestamp.ToLocalTime().ToString("HH:mm:ss")</td>
-                        <td><span class="pill">@entry.Format</span></td>
-                        <td class="mono">@entry.Text</td>
+                        <td><span class="pill" data-testid="result-format">@entry.Format</span></td>
+                        <td class="mono" data-testid="result-value">@entry.Text</td>
                         <td class="mono" style="white-space:nowrap;">@Describe(entry.BoundingBox)</td>
                         <td>@Describe(entry.Metadata)</td>
                     </tr>
                 }
             </tbody>
         </table>
+        </div>
     }
 </div>
 

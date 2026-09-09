@@ -27,11 +27,18 @@ namespace BlazorBarcodeScanner;
 /// </remarks>
 public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
 {
+    /// <summary>Returned by the frame grab when the camera track has ended.</summary>
+    private const int FrameTrackEnded = -2;
+
+    /// <summary>Returned by the frame grab when the buffer is too small for a frame.</summary>
+    private const int FrameBufferTooSmall = -1;
+
     private readonly string _sessionId = $"bs-{Guid.NewGuid():N}";
     private readonly string _videoElementId = $"bscan-video-{Guid.NewGuid():N}";
     private readonly string _fileInputId = $"bscan-file-{Guid.NewGuid():N}";
 
     private BarcodeDecoder? _decoder;
+    private string? _decoderSignature;
     private CancellationTokenSource? _loopCancellation;
     private PeriodicTimer? _timer;
     private byte[] _frameBuffer = [];
@@ -44,6 +51,9 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
     private string? _announcement;
     private string? _highlight;
     private string? _activeDeviceId;
+    private string? _lastRequestedDeviceId;
+    private CameraFacing _lastRequestedFacing;
+    private bool _restartRequested;
     private bool _mirrored;
     private bool _torchOn;
     private double _zoom;
@@ -51,6 +61,8 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
     private int _processingHeight;
     private bool _renderPending = true;
     private long _lastDiagnosticsAt;
+    private int _startVersion;
+    private int _changeToken;
     private bool _disposed;
 
     /// <summary>The symbologies to look for.</summary>
@@ -59,7 +71,8 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
 
     /// <summary>
     /// The part of the frame to search, in normalized coordinates. The default searches the whole
-    /// frame; a centred square is the usual choice for an aiming user interface.
+    /// frame; a centred square is the usual choice for an aiming user interface. Still images
+    /// scanned through the file picker are always searched in full.
     /// </summary>
     [Parameter]
     public ScanRegion Region { get; set; } = ScanRegion.Full;
@@ -95,7 +108,10 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
     [Parameter]
     public CameraFacing Facing { get; set; } = CameraFacing.Rear;
 
-    /// <summary>A specific camera to open, from <see cref="GetCamerasAsync"/>.</summary>
+    /// <summary>
+    /// A specific camera to open, from <see cref="GetCamerasAsync"/>. Changing it while the
+    /// scanner is running switches cameras.
+    /// </summary>
     [Parameter]
     public string? DeviceId { get; set; }
 
@@ -131,7 +147,10 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
     [Parameter]
     public bool EnableFileScanning { get; set; } = true;
 
-    /// <summary>Stretch to the height of the parent instead of keeping a 4:3 box.</summary>
+    /// <summary>
+    /// Stretch to the size of the parent instead of keeping the camera's aspect ratio. The video
+    /// is cropped to fill; overlays and highlights are mapped onto the visible part.
+    /// </summary>
     [Parameter]
     public bool Fill { get; set; }
 
@@ -198,39 +217,52 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
     /// <summary>Timings from the most recently decoded frame.</summary>
     public ScanDiagnostics Diagnostics => _decoder?.LastFrame ?? default;
 
+    /// <summary>Number of camera frames decoded since the scanner was created.</summary>
+    public long FramesDecoded => _decoder?.FramesDecoded ?? 0;
+
+    /// <summary>Number of camera frames that contained a symbol, before duplicate suppression.</summary>
+    public long FramesWithSymbol => _decoder?.FramesWithSymbol ?? 0;
+
     /// <summary>Whether the torch is currently on.</summary>
     public bool IsTorchOn => _torchOn;
 
     /// <summary>Current zoom value, or zero when zoom is not supported.</summary>
     public double Zoom => _zoom;
 
+    /// <summary>Size of the frames handed to the decoder, or zero before the camera has opened.</summary>
+    public (int Width, int Height) ProcessingSize => (_processingWidth, _processingHeight);
+
     /// <inheritdoc />
     protected override void OnParametersSet()
     {
+        // A parameter changed, so whatever it controls has to be drawn again.
+        RequestRender();
+
         _region = Region.Normalized();
 
         if (_decoder is not null)
         {
-            if (_decoder.Options.Formats != Formats)
+            var signature = DecoderSignature();
+            if (signature != _decoderSignature)
             {
-                // The decoder builds its symbology list up front, so a format change needs a new one.
+                // The decoder builds its symbology list and scratch state up front, so a change
+                // to anything but the region and the suppression window needs a new one.
                 var previous = _decoder;
                 _decoder = CreateDecoder();
                 previous.Dispose();
             }
             else
             {
-                // Everything else is live-editable, so a running scanner picks up parameter
-                // changes without dropping the camera.
+                // The rest is live-editable, so a running scanner picks up parameter changes
+                // without dropping the camera.
                 _decoder.Options.Region = _region;
-                _decoder.Options.TryHarder = Options?.TryHarder ?? _decoder.Options.TryHarder;
                 _decoder.DuplicateSuppressionWindow = Options?.DuplicateSuppressionWindow ?? DuplicateSuppressionWindow;
             }
         }
 
         if (_timer is not null)
         {
-            _timer.Period = TimeSpan.FromMilliseconds(1000.0 / Math.Clamp(TargetFrameRate, 1, 60));
+            _timer.Period = FrameInterval();
         }
 
         if (_camera is not null && _status is ScannerStatus.Scanning or ScannerStatus.Paused)
@@ -242,41 +274,71 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
                 ConfigureProcessingSize(_camera.Width, _camera.Height);
             }
         }
+
+        // A different camera was asked for: switch after this render. This is checked while the
+        // camera is still opening too, because a request made during the permission prompt would
+        // otherwise be dropped and never revisited.
+        if (_status is ScannerStatus.Starting or ScannerStatus.Scanning or ScannerStatus.Paused &&
+            (DeviceId != _lastRequestedDeviceId || (DeviceId is null && Facing != _lastRequestedFacing)))
+        {
+            _restartRequested = true;
+        }
     }
 
     /// <inheritdoc />
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        if (!firstRender)
+        if (_disposed)
         {
             return;
         }
 
         if (!OperatingSystem.IsBrowser())
         {
-            // Prerendering on the server is expected and harmless; the component activates once
-            // the WebAssembly runtime takes over.
+            // Prerendering is expected and harmless: the component activates once the
+            // WebAssembly runtime takes over. An interactive render mode that is not the
+            // browser, though, will never activate, and saying so is better than a Start button
+            // that quietly does nothing.
+            if (firstRender && RendererInfo.IsInteractive)
+            {
+                await FailAsync(new ScannerException(
+                    ScannerErrorKind.NotSupported,
+                    "Camera scanning needs Blazor WebAssembly; this component is running on the "
+                    + $"{RendererInfo.Name} renderer, which cannot reach the browser's camera API.")).ConfigureAwait(true);
+            }
+
             return;
         }
 
-        if (!await EnsureModuleAsync().ConfigureAwait(true))
+        if (!firstRender)
+        {
+            if (_restartRequested)
+            {
+                _restartRequested = false;
+                await StartAsync().ConfigureAwait(true);
+            }
+
+            return;
+        }
+
+        if (!await EnsureModuleAsync().ConfigureAwait(true) || _disposed)
         {
             return;
         }
 
         if (!ScannerJsInterop.IsCameraSupported())
         {
-            Fail(new ScannerException(
+            await FailAsync(new ScannerException(
                 ScannerErrorKind.NotSupported,
                 ScannerJsInterop.IsSecureContext()
                     ? "This browser does not expose a camera API to the page."
-                    : "The camera API needs a secure context; serve the application over HTTPS or from localhost."));
+                    : "The camera API needs a secure context; serve the application over HTTPS or from localhost.")).ConfigureAwait(true);
             return;
         }
 
         await RefreshCamerasAsync().ConfigureAwait(true);
 
-        if (AutoStart)
+        if (AutoStart && !_disposed && _status == ScannerStatus.Idle)
         {
             await StartAsync().ConfigureAwait(true);
         }
@@ -289,7 +351,7 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
     /// </remarks>
     public async Task<IReadOnlyList<CameraDevice>> GetCamerasAsync()
     {
-        if (await EnsureModuleAsync().ConfigureAwait(true))
+        if (!_disposed && await EnsureModuleAsync().ConfigureAwait(true))
         {
             await RefreshCamerasAsync().ConfigureAwait(true);
         }
@@ -298,6 +360,10 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
     }
 
     /// <summary>Opens the camera and starts decoding.</summary>
+    /// <remarks>
+    /// Calling this while a previous start is still waiting for the permission prompt supersedes
+    /// that start: only the most recent request ever ends up owning the camera.
+    /// </remarks>
     /// <param name="deviceId">A specific camera, or <see langword="null"/> to use <see cref="DeviceId"/> and <see cref="Facing"/>.</param>
     public async Task StartAsync(string? deviceId = null)
     {
@@ -306,17 +372,22 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
             return;
         }
 
-        if (!await EnsureModuleAsync().ConfigureAwait(true))
+        if (!await EnsureModuleAsync().ConfigureAwait(true) || _disposed)
         {
             return;
         }
 
-        if (_status is ScannerStatus.Starting or ScannerStatus.Scanning)
-        {
-            await StopAsync().ConfigureAwait(true);
-        }
+        var version = ++_startVersion;
+        StopFrameLoop();
 
-        SetStatus(ScannerStatus.Starting, "Requesting camera access...");
+        _highlight = null;
+        _lastRequestedDeviceId = DeviceId;
+        _lastRequestedFacing = Facing;
+        await SetStatusAsync(ScannerStatus.Starting, "Requesting camera access...").ConfigureAwait(true);
+        if (IsStale(version))
+        {
+            return;
+        }
 
         var facing = Facing switch
         {
@@ -338,55 +409,83 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
         }
         catch (Exception ex)
         {
-            Fail(ScannerException.FromBrowserError(ex));
+            if (!IsStale(version))
+            {
+                // The browser may have attached a stream before failing, so release the session
+                // rather than trusting the rejection to have cleaned up after itself.
+                ScannerJsInterop.Stop(_sessionId);
+                await FailAsync(ScannerException.FromBrowserError(ex)).ConfigureAwait(true);
+            }
+
             return;
         }
 
-        _camera = JsonSerializer.Deserialize(json, ScannerJsonContext.Default.CameraInfo);
-        if (_camera is null || _camera.Width <= 0 || _camera.Height <= 0)
+        if (IsStale(version))
         {
-            Fail(new ScannerException(ScannerErrorKind.Unknown, "The camera opened but reported no video size."));
+            // A newer start, a stop or disposal won the race; JavaScript has already released
+            // this stream.
             return;
         }
 
-        _activeDeviceId = _camera.DeviceId;
-        _mirrored = _camera.FacingMode == "user";
-        _torchOn = _camera.TorchOn;
-        _zoom = _camera.Zoom;
+        var camera = JsonSerializer.Deserialize(json, ScannerJsonContext.Default.CameraInfo);
+        if (camera is null || camera.Width <= 0 || camera.Height <= 0)
+        {
+            ScannerJsInterop.Stop(_sessionId);
+            await FailAsync(new ScannerException(ScannerErrorKind.Unknown, "The camera opened but reported no video size.")).ConfigureAwait(true);
+            return;
+        }
 
-        ConfigureProcessingSize(_camera.Width, _camera.Height);
+        _camera = camera;
+        _changeToken = ScannerJsInterop.PollChanges(_sessionId);
+        _activeDeviceId = camera.DeviceId;
+        _mirrored = camera.FacingMode == "user";
+        _torchOn = camera.TorchOn;
+        _zoom = camera.Zoom;
+
+        ConfigureProcessingSize(camera.Width, camera.Height);
 
         _decoder ??= CreateDecoder();
         _decoder.ResetDuplicateFilter();
 
         // Labels only become readable once permission has been granted, so refresh them now.
         await RefreshCamerasAsync().ConfigureAwait(true);
+        if (IsStale(version))
+        {
+            return;
+        }
 
-        SetStatus(ScannerStatus.Scanning, null);
-        await OnCameraChanged.InvokeAsync(_camera).ConfigureAwait(true);
+        await SetStatusAsync(ScannerStatus.Scanning, null).ConfigureAwait(true);
+        if (IsStale(version))
+        {
+            return;
+        }
+
+        await InvokeCallbackAsync(OnCameraChanged, camera).ConfigureAwait(true);
+        if (IsStale(version))
+        {
+            return;
+        }
 
         _loopCancellation = new CancellationTokenSource();
-        _ = RunFrameLoopAsync(_loopCancellation.Token);
+        _ = RunFrameLoopAsync(_loopCancellation.Token, version);
     }
 
     /// <summary>Stops decoding and releases the camera.</summary>
     public async Task StopAsync()
     {
-        if (_loopCancellation is not null)
-        {
-            await _loopCancellation.CancelAsync().ConfigureAwait(true);
-            _loopCancellation.Dispose();
-            _loopCancellation = null;
-        }
+        _startVersion++;
+        StopFrameLoop();
 
         if (OperatingSystem.IsBrowser() && ScannerJsInterop.IsImported)
         {
             ScannerJsInterop.Stop(_sessionId);
         }
 
-        _highlight = null;
-        _camera = null;
-        SetStatus(ScannerStatus.Stopped, null);
+        ClearCameraState();
+        if (!_disposed)
+        {
+            await SetStatusAsync(ScannerStatus.Stopped, null).ConfigureAwait(true);
+        }
     }
 
     /// <summary>Stops decoding but keeps the camera open, so resuming is instant.</summary>
@@ -394,7 +493,7 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
     {
         if (_status == ScannerStatus.Scanning)
         {
-            SetStatus(ScannerStatus.Paused, null);
+            _ = SetStatusAsync(ScannerStatus.Paused, null);
         }
     }
 
@@ -404,7 +503,7 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
         if (_status == ScannerStatus.Paused)
         {
             _decoder?.ResetDuplicateFilter();
-            SetStatus(ScannerStatus.Scanning, null);
+            _ = SetStatusAsync(ScannerStatus.Scanning, null);
         }
     }
 
@@ -421,18 +520,25 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
     /// <returns><see langword="true"/> when the browser accepted the request.</returns>
     public async Task<bool> SetTorchAsync(bool on)
     {
-        if (!OperatingSystem.IsBrowser() || _camera?.SupportsTorch != true)
+        if (!OperatingSystem.IsBrowser() || _disposed || _camera?.SupportsTorch != true || !ScannerJsInterop.IsImported)
         {
             return false;
         }
 
         var accepted = await ScannerJsInterop.SetTorchAsync(_sessionId, on).ConfigureAwait(true);
+        if (_disposed)
+        {
+            return accepted;
+        }
+
         if (accepted)
         {
             _torchOn = on;
-            RequestRender();
         }
 
+        // Render either way: a refused request has to put the control back where it was.
+        RequestRender();
+        StateHasChanged();
         return accepted;
     }
 
@@ -441,31 +547,42 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
     /// <returns><see langword="true"/> when the browser accepted the request.</returns>
     public async Task<bool> SetZoomAsync(double zoom)
     {
-        if (!OperatingSystem.IsBrowser() || _camera?.SupportsZoom != true)
+        if (!OperatingSystem.IsBrowser() || _disposed || _camera?.SupportsZoom != true || !ScannerJsInterop.IsImported)
+        {
+            return false;
+        }
+
+        if (double.IsNaN(zoom))
         {
             return false;
         }
 
         zoom = Math.Clamp(zoom, _camera.ZoomMin, _camera.ZoomMax);
         var accepted = await ScannerJsInterop.SetZoomAsync(_sessionId, zoom).ConfigureAwait(true);
+        if (_disposed)
+        {
+            return accepted;
+        }
+
         if (accepted)
         {
             _zoom = zoom;
-            RequestRender();
         }
 
+        RequestRender();
+        StateHasChanged();
         return accepted;
     }
 
     /// <summary>Opens the file picker so the user can scan a still image.</summary>
     public async Task OpenFilePickerAsync()
     {
-        if (!OperatingSystem.IsBrowser() || !EnableFileScanning)
+        if (!OperatingSystem.IsBrowser() || _disposed || !EnableFileScanning)
         {
             return;
         }
 
-        if (await EnsureModuleAsync().ConfigureAwait(true))
+        if (await EnsureModuleAsync().ConfigureAwait(true) && !_disposed)
         {
             ScannerJsInterop.Click(_fileInputId);
         }
@@ -473,7 +590,8 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
 
     /// <summary>
     /// Decodes an image already loaded into a pixel buffer, for applications that source images
-    /// themselves rather than through the built-in picker.
+    /// themselves rather than through the built-in picker. The whole image is searched with the
+    /// still image settings, using the symbologies and options of this scanner.
     /// </summary>
     /// <param name="pixels">Packed pixels.</param>
     /// <param name="width">Image width.</param>
@@ -481,13 +599,13 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
     /// <param name="format">Pixel layout.</param>
     public BarcodeResult? DecodeImage(ReadOnlySpan<byte> pixels, int width, int height, PixelFormat format)
     {
-        using var decoder = new BarcodeDecoder(BuildOptions(ScannerOptions.ForStillImages()));
+        using var decoder = new BarcodeDecoder(BuildStillImageOptions());
         return decoder.Decode(pixels, width, height, format, suppressDuplicates: false);
     }
 
     private async Task OnFileSelectedAsync(ChangeEventArgs args)
     {
-        if (!OperatingSystem.IsBrowser())
+        if (!OperatingSystem.IsBrowser() || _disposed || !ScannerJsInterop.IsImported)
         {
             return;
         }
@@ -502,9 +620,15 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
             packed = await ScannerJsInterop.PrepareImageFromInputAsync(_sessionId, _fileInputId, 1600)
                 .ConfigureAwait(true);
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            Fail(new ScannerException(ScannerErrorKind.Unknown, "The selected file could not be read as an image.", ex));
+            // An unreadable file is a message for the user, not a fault of the running camera.
+            SetMessage("The selected file could not be read as an image.");
+            return;
+        }
+
+        if (_disposed)
+        {
             return;
         }
 
@@ -520,14 +644,24 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
         var buffer = new byte[required];
 
         var written = ScannerJsInterop.ReadPrepared(_sessionId, buffer);
-        if (written <= 0)
+        if (written < required)
         {
             SetMessage("The image could not be read.");
             return;
         }
 
-        using var stillDecoder = new BarcodeDecoder(BuildOptions(ScannerOptions.ForStillImages()));
-        var result = stillDecoder.Decode(buffer.AsSpan(0, written), width, height, PixelFormat.Rgba32, suppressDuplicates: false);
+        BarcodeResult? result;
+        try
+        {
+            using var stillDecoder = new BarcodeDecoder(BuildStillImageOptions());
+            result = stillDecoder.Decode(buffer.AsSpan(0, written), width, height, PixelFormat.Rgba32, suppressDuplicates: false);
+        }
+        catch (Exception ex)
+        {
+            SetMessage("The image could not be decoded.");
+            await DispatchExceptionAsync(ex).ConfigureAwait(true);
+            return;
+        }
 
         SetMessage(result is null ? "No barcode found in that image." : null);
 
@@ -535,25 +669,30 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
         {
             _announcement = $"{result.Format}: {result.Text}";
             RequestRender();
-            await OnScan.InvokeAsync(result).ConfigureAwait(true);
+            StateHasChanged();
+            await InvokeCallbackAsync(OnScan, result).ConfigureAwait(true);
         }
     }
 
-    private async Task RunFrameLoopAsync(CancellationToken cancellationToken)
+    private async Task RunFrameLoopAsync(CancellationToken cancellationToken, int version)
     {
         if (!OperatingSystem.IsBrowser())
         {
             return;
         }
 
-        var interval = TimeSpan.FromMilliseconds(1000.0 / Math.Clamp(TargetFrameRate, 1, 60));
-        using var timer = new PeriodicTimer(interval);
+        using var timer = new PeriodicTimer(FrameInterval());
         _timer = timer;
 
         try
         {
             while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(true))
             {
+                if (IsStale(version))
+                {
+                    return;
+                }
+
                 if (_status != ScannerStatus.Scanning || _decoder is null)
                 {
                     continue;
@@ -563,8 +702,42 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
                 // last grab, so an idle camera costs one interop call and nothing else. This is
                 // also the backpressure mechanism: a slow decode simply misses ticks and the
                 // next grab returns the newest frame rather than a queued stale one.
+                await ApplyBrowserChangesAsync().ConfigureAwait(true);
+                if (IsStale(version))
+                {
+                    return;
+                }
+
                 var written = ScannerJsInterop.GrabFrame(_sessionId, _frameBuffer);
-                if (written <= 0)
+                if (written == 0)
+                {
+                    continue;
+                }
+
+                if (written == FrameTrackEnded)
+                {
+                    // The camera went away: unplugged, taken over by another application, or the
+                    // permission was revoked. Release what is left and report it.
+                    ScannerJsInterop.Stop(_sessionId);
+                    await FailAsync(new ScannerException(
+                        ScannerErrorKind.CameraUnavailable,
+                        "The camera stopped delivering frames; it may have been disconnected or claimed by another application.")).ConfigureAwait(true);
+                    return;
+                }
+
+                if (written == FrameBufferTooSmall)
+                {
+                    // The frame buffer and the canvas are sized together, so this cannot happen
+                    // without an invariant having been broken. Retrying would spin at the frame
+                    // rate reporting nothing, so it is treated as a fault.
+                    ScannerJsInterop.Stop(_sessionId);
+                    await FailAsync(new ScannerException(
+                        ScannerErrorKind.Unknown,
+                        "The frame buffer no longer matches the camera's frame size.")).ConfigureAwait(true);
+                    return;
+                }
+
+                if (written < _processingWidth * _processingHeight * 4)
                 {
                     continue;
                 }
@@ -580,13 +753,14 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
-                    Fail(new ScannerException(ScannerErrorKind.Unknown, "The decoder failed on a frame.", ex));
+                    ScannerJsInterop.Stop(_sessionId);
+                    await FailAsync(new ScannerException(ScannerErrorKind.Unknown, "The decoder failed on a frame.", ex)).ConfigureAwait(true);
                     return;
                 }
 
                 await ReportDiagnosticsAsync().ConfigureAwait(true);
 
-                if (result is null)
+                if (result is null || IsStale(version))
                 {
                     continue;
                 }
@@ -596,16 +770,125 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
                 RequestRender();
                 StateHasChanged();
 
-                await OnScan.InvokeAsync(result).ConfigureAwait(true);
+                await InvokeCallbackAsync(OnScan, result).ConfigureAwait(true);
             }
         }
         catch (OperationCanceledException)
         {
             // Expected on stop and on disposal.
         }
+        catch (Exception ex)
+        {
+            // Nothing else should escape, but a dead loop with a live camera would be the worst
+            // outcome, so surface it and release the camera. This runs on a fire-and-forget
+            // task, so it must not throw on its way out either.
+            try
+            {
+                if (!IsStale(version))
+                {
+                    if (ScannerJsInterop.IsImported)
+                    {
+                        ScannerJsInterop.Stop(_sessionId);
+                    }
+
+                    await FailAsync(new ScannerException(ScannerErrorKind.Unknown, "The frame loop failed.", ex)).ConfigureAwait(true);
+                }
+            }
+            catch (Exception failure) when (failure is not OperationCanceledException)
+            {
+                // The renderer is already gone; there is nowhere left to report this.
+            }
+        }
         finally
         {
-            _timer = null;
+            if (ReferenceEquals(_timer, timer))
+            {
+                _timer = null;
+            }
+
+            // Whatever ended this loop, its cancellation source is finished with.
+            if (!IsStale(version))
+            {
+                StopFrameLoop();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Picks up the two things the browser can change underneath a running scanner: the size of
+    /// the video element, and the resolution the camera track renegotiated.
+    /// </summary>
+    /// <remarks>
+    /// A track that changes resolution, which mobile browsers do when the device is rotated,
+    /// would otherwise keep being drawn into a canvas of the old shape. The frames handed to the
+    /// decoder would be anamorphically squashed, finder patterns would stop being square, and
+    /// the scanner would go on reporting "Scanning" while reading nothing at all.
+    /// </remarks>
+    private async Task ApplyBrowserChangesAsync()
+    {
+        if (!OperatingSystem.IsBrowser() || !ScannerJsInterop.IsImported)
+        {
+            return;
+        }
+
+        var token = ScannerJsInterop.PollChanges(_sessionId);
+        if (token == _changeToken)
+        {
+            return;
+        }
+
+        var videoChanged = (token >> 8) != (_changeToken >> 8);
+        _changeToken = token;
+
+        if (!videoChanged)
+        {
+            // Only the element was resized. That moves the overlays, which are expressed
+            // relative to the visible part of the frame, but nothing else.
+            if (Fill)
+            {
+                RequestRender();
+                StateHasChanged();
+            }
+
+            return;
+        }
+
+        var json = ScannerJsInterop.Describe(_sessionId);
+        if (string.IsNullOrEmpty(json))
+        {
+            return;
+        }
+
+        CameraInfo? camera;
+        try
+        {
+            camera = JsonSerializer.Deserialize(json, ScannerJsonContext.Default.CameraInfo);
+        }
+        catch (JsonException)
+        {
+            return;
+        }
+
+        if (camera is null || camera.Width <= 0 || camera.Height <= 0)
+        {
+            return;
+        }
+
+        var resized = _camera is null || camera.Width != _camera.Width || camera.Height != _camera.Height;
+        _camera = camera;
+        _mirrored = camera.FacingMode == "user";
+
+        if (resized)
+        {
+            ConfigureProcessingSize(camera.Width, camera.Height);
+        }
+
+        RequestRender();
+        StateHasChanged();
+
+        if (resized)
+        {
+            await InvokeCallbackAsync(OnCameraChanged, camera).ConfigureAwait(true);
         }
     }
 
@@ -623,7 +906,32 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
         }
 
         _lastDiagnosticsAt = now;
-        await OnDiagnostics.InvokeAsync(_decoder.LastFrame).ConfigureAwait(true);
+        await InvokeCallbackAsync(OnDiagnostics, _decoder.LastFrame).ConfigureAwait(true);
+    }
+
+    private TimeSpan FrameInterval() => TimeSpan.FromMilliseconds(1000.0 / Math.Clamp(TargetFrameRate, 1, 60));
+
+    private bool IsStale(int version) => _disposed || version != _startVersion;
+
+    private void StopFrameLoop()
+    {
+        var cancellation = _loopCancellation;
+        _loopCancellation = null;
+        if (cancellation is null)
+        {
+            return;
+        }
+
+        cancellation.Cancel();
+        cancellation.Dispose();
+    }
+
+    private void ClearCameraState()
+    {
+        _highlight = null;
+        _camera = null;
+        _torchOn = false;
+        _zoom = 0;
     }
 
     private void ConfigureProcessingSize(int cameraWidth, int cameraHeight)
@@ -642,7 +950,9 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
             _frameBuffer = new byte[required];
         }
 
-        if (OperatingSystem.IsBrowser() && ScannerJsInterop.IsImported)
+        // Configure creates the session if it is missing, so a call after disposal would
+        // resurrect one that nothing will ever release.
+        if (OperatingSystem.IsBrowser() && ScannerJsInterop.IsImported && !_disposed)
         {
             ScannerJsInterop.Configure(_sessionId, _processingWidth, _processingHeight);
         }
@@ -659,7 +969,7 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
     /// </remarks>
     private async Task<bool> EnsureModuleAsync()
     {
-        if (!OperatingSystem.IsBrowser())
+        if (!OperatingSystem.IsBrowser() || _disposed)
         {
             return false;
         }
@@ -672,19 +982,36 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
         try
         {
             await ScannerJsInterop.EnsureImportedAsync().ConfigureAwait(true);
-            return true;
+            return !_disposed;
         }
         catch (Exception ex)
         {
-            Fail(new ScannerException(
-                ScannerErrorKind.NotSupported,
-                "The BlazorBarcodeScanner JavaScript module could not be loaded. Check that static web assets are served.",
-                ex));
+            if (!_disposed)
+            {
+                await FailAsync(new ScannerException(
+                    ScannerErrorKind.NotSupported,
+                    "The BlazorBarcodeScanner JavaScript module could not be loaded. Check that static web assets are served.",
+                    ex)).ConfigureAwait(true);
+            }
+
             return false;
         }
     }
 
-    private BarcodeDecoder CreateDecoder() => new(BuildOptions(Options?.Clone() ?? new ScannerOptions()));
+    private BarcodeDecoder CreateDecoder()
+    {
+        _decoderSignature = DecoderSignature();
+        return new BarcodeDecoder(BuildOptions(Options?.Clone() ?? new ScannerOptions()));
+    }
+
+    /// <summary>Everything the decoder bakes in at construction, so a change can be detected.</summary>
+    private string DecoderSignature()
+    {
+        var options = Options;
+        return string.Create(
+            CultureInfo.InvariantCulture,
+            $"{(int)Formats}|{options?.MaxScanLines}|{options?.DownsampleFactor}|{options?.TryHarder}|{options?.AllowInverted}|{options?.TryReversedRows}|{options?.TryVerticalLines}|{options?.Code39CheckDigit}|{options?.Code39ExtendedMode}|{(options is null ? "" : string.Join(',', options.ItfLengths))}");
+    }
 
     private ScannerOptions BuildOptions(ScannerOptions baseOptions)
     {
@@ -698,9 +1025,27 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
         return baseOptions;
     }
 
+    /// <summary>
+    /// Still images keep the application's symbology options but flip the latency trade-offs:
+    /// exhaustive detection, inverted symbols, every scan line, the whole image.
+    /// </summary>
+    private ScannerOptions BuildStillImageOptions()
+    {
+        var options = Options?.Clone() ?? new ScannerOptions();
+        var still = ScannerOptions.ForStillImages();
+        options.Formats = Formats;
+        options.Region = ScanRegion.Full;
+        options.MaxScanLines = Math.Max(options.MaxScanLines, still.MaxScanLines);
+        options.TryHarder = true;
+        options.AllowInverted = true;
+        options.TryVerticalLines = true;
+        options.DuplicateSuppressionWindow = TimeSpan.Zero;
+        return options;
+    }
+
     private async Task RefreshCamerasAsync()
     {
-        if (!OperatingSystem.IsBrowser() || !ScannerJsInterop.IsImported)
+        if (!OperatingSystem.IsBrowser() || _disposed || !ScannerJsInterop.IsImported)
         {
             return;
         }
@@ -727,6 +1072,11 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
         {
             await SwitchCameraAsync(deviceId).ConfigureAwait(true);
         }
+
+        // The selection has to fall back to the camera that is actually open if the switch
+        // failed, so this renders whatever the outcome was.
+        RequestRender();
+        StateHasChanged();
     }
 
     private async Task OnZoomChangedAsync(ChangeEventArgs args)
@@ -761,32 +1111,114 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
         }
 
         var box = result.BoundingBox;
-        var left = box.X / _processingWidth * 100;
-        var top = box.Y / _processingHeight * 100;
-        var width = Math.Max(box.Width, 4) / _processingWidth * 100;
-        var height = Math.Max(box.Height, 4) / _processingHeight * 100;
+        var left = box.X / _processingWidth;
+        var top = box.Y / _processingHeight;
+        var width = Math.Max(box.Width, 4) / _processingWidth;
+        var height = Math.Max(box.Height, 4) / _processingHeight;
 
+        var (viewLeft, viewTop, viewWidth, viewHeight) = FrameToView(left, top, width, height);
         _highlight = string.Create(
             CultureInfo.InvariantCulture,
-            $"--bscan-hit-left:{left:0.##}%;--bscan-hit-top:{top:0.##}%;--bscan-hit-width:{width:0.##}%;--bscan-hit-height:{height:0.##}%");
+            $"--bscan-hit-left:{viewLeft * 100:0.##}%;--bscan-hit-top:{viewTop * 100:0.##}%;--bscan-hit-width:{viewWidth * 100:0.##}%;--bscan-hit-height:{viewHeight * 100:0.##}%");
+    }
+
+    /// <summary>
+    /// Maps a normalized rectangle in frame coordinates onto the visible part of the video
+    /// element: the box keeps the camera's aspect ratio unless <see cref="Fill"/> crops it, and a
+    /// front camera is shown mirrored.
+    /// </summary>
+    private (double Left, double Top, double Width, double Height) FrameToView(double left, double top, double width, double height)
+    {
+        if (_mirrored)
+        {
+            left = 1 - left - width;
+        }
+
+        if (!Fill || _camera is null || _camera.Width <= 0 || _camera.Height <= 0 ||
+            !OperatingSystem.IsBrowser() || !ScannerJsInterop.IsImported)
+        {
+            return (left, top, width, height);
+        }
+
+        var packed = ScannerJsInterop.GetViewSize(_sessionId);
+        var viewWidth = packed >> 16;
+        var viewHeight = packed & 0xFFFF;
+        if (viewWidth <= 0 || viewHeight <= 0)
+        {
+            return (left, top, width, height);
+        }
+
+        // object-fit: cover keeps the frame's aspect ratio and crops whichever axis overflows.
+        var frameAspect = (double)_camera.Width / _camera.Height;
+        var viewAspect = (double)viewWidth / viewHeight;
+        if (viewAspect > frameAspect)
+        {
+            // The frame is scaled to the view's width; rows at the top and bottom are cropped.
+            var visible = frameAspect / viewAspect;
+            var crop = (1 - visible) / 2;
+            return (left, (top - crop) / visible, width, height / visible);
+        }
+        else
+        {
+            var visible = viewAspect / frameAspect;
+            var crop = (1 - visible) / 2;
+            return ((left - crop) / visible, top, width / visible, height);
+        }
     }
 
     private string MaskClipPath()
     {
-        var left = _region.X * 100;
-        var top = _region.Y * 100;
-        var right = (_region.X + _region.Width) * 100;
-        var bottom = (_region.Y + _region.Height) * 100;
+        var (left, top, width, height) = FrameToView(_region.X, _region.Y, _region.Width, _region.Height);
+        var l = Math.Clamp(left, 0, 1) * 100;
+        var t = Math.Clamp(top, 0, 1) * 100;
+        var r = Math.Clamp(left + width, 0, 1) * 100;
+        var b = Math.Clamp(top + height, 0, 1) * 100;
 
         // An even-odd polygon: the outer ring is the frame, the inner ring is the hole.
         return string.Create(
             CultureInfo.InvariantCulture,
-            $"polygon(evenodd, 0% 0%, 100% 0%, 100% 100%, 0% 100%, 0% 0%, {left:0.##}% {top:0.##}%, {right:0.##}% {top:0.##}%, {right:0.##}% {bottom:0.##}%, {left:0.##}% {bottom:0.##}%, {left:0.##}% {top:0.##}%)");
+            $"polygon(evenodd, 0% 0%, 100% 0%, 100% 100%, 0% 100%, 0% 0%, {l:0.##}% {t:0.##}%, {r:0.##}% {t:0.##}%, {r:0.##}% {b:0.##}%, {l:0.##}% {b:0.##}%, {l:0.##}% {t:0.##}%)");
     }
 
-    private string ReticleStyle() => string.Create(
-        CultureInfo.InvariantCulture,
-        $"inset-inline-start:{_region.X * 100:0.##}%;inset-block-start:{_region.Y * 100:0.##}%;inline-size:{_region.Width * 100:0.##}%;block-size:{_region.Height * 100:0.##}%");
+    private string ReticleStyle()
+    {
+        var (left, top, width, height) = FrameToView(_region.X, _region.Y, _region.Width, _region.Height);
+        return string.Create(
+            CultureInfo.InvariantCulture,
+            $"inset-inline-start:{left * 100:0.##}%;inset-block-start:{top * 100:0.##}%;inline-size:{width * 100:0.##}%;block-size:{height * 100:0.##}%");
+    }
+
+    /// <summary>
+    /// The root element's classes: the component's own, the application's <see cref="CssClass"/>,
+    /// and any class supplied through an unmatched attribute, which would otherwise replace them.
+    /// </summary>
+    private string RootClass()
+    {
+        var own = string.IsNullOrWhiteSpace(CssClass) ? "bscan" : $"bscan {CssClass}";
+        return AdditionalAttributes?.TryGetValue("class", out var extra) == true &&
+               extra is string text && !string.IsNullOrWhiteSpace(text)
+            ? $"{own} {text}"
+            : own;
+    }
+
+    private string? RootStyle()
+    {
+        string? aspect = null;
+        if (!Fill && _camera is { Width: > 0, Height: > 0 })
+        {
+            // Keep the box at the camera's aspect ratio so that nothing is cropped and overlays
+            // line up with the frame exactly.
+            aspect = string.Create(CultureInfo.InvariantCulture, $"--bscan-aspect:{_camera.Width}/{_camera.Height}");
+        }
+
+        var extra = AdditionalAttributes?.TryGetValue("style", out var value) == true ? value?.ToString() : null;
+        if (string.IsNullOrWhiteSpace(extra))
+        {
+            return aspect;
+        }
+
+        return aspect is null ? extra : $"{extra.TrimEnd().TrimEnd(';')};{aspect}";
+    }
 
     private string StatusText() => _status switch
     {
@@ -798,18 +1230,19 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
         _ => "Error",
     };
 
-    private void SetStatus(ScannerStatus status, string? message)
+    private Task SetStatusAsync(ScannerStatus status, string? message)
     {
         if (_status == status && _message == message)
         {
-            return;
+            return Task.CompletedTask;
         }
 
+        var changed = _status != status;
         _status = status;
         _message = message;
         RequestRender();
         StateHasChanged();
-        _ = OnStatusChanged.InvokeAsync(status);
+        return changed ? InvokeCallbackAsync(OnStatusChanged, status) : Task.CompletedTask;
     }
 
     private void SetMessage(string? message)
@@ -824,14 +1257,40 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
         StateHasChanged();
     }
 
-    private void Fail(ScannerException exception)
+    private async Task FailAsync(ScannerException exception)
     {
+        // A faulted scanner owns no camera, so nothing may keep describing one: leaving
+        // _camera set would go on offering a torch button and a zoom slider for a dead track.
+        ClearCameraState();
+
         _status = ScannerStatus.Faulted;
         _message = exception.Message;
         RequestRender();
         StateHasChanged();
-        _ = OnStatusChanged.InvokeAsync(ScannerStatus.Faulted);
-        _ = OnError.InvokeAsync(exception);
+        await InvokeCallbackAsync(OnStatusChanged, ScannerStatus.Faulted).ConfigureAwait(true);
+        await InvokeCallbackAsync(OnError, exception).ConfigureAwait(true);
+    }
+
+    /// <summary>
+    /// Invokes an application callback and routes anything it throws to the renderer, the way
+    /// Blazor treats exceptions from its own event handlers, instead of letting it vanish inside
+    /// a fire-and-forget task or tear down the frame loop.
+    /// </summary>
+    private async Task InvokeCallbackAsync<T>(EventCallback<T> callback, T argument)
+    {
+        if (!callback.HasDelegate)
+        {
+            return;
+        }
+
+        try
+        {
+            await callback.InvokeAsync(argument).ConfigureAwait(true);
+        }
+        catch (Exception ex)
+        {
+            await DispatchExceptionAsync(ex).ConfigureAwait(true);
+        }
     }
 
     private void RequestRender() => _renderPending = true;
@@ -858,13 +1317,8 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
         }
 
         _disposed = true;
-
-        if (_loopCancellation is not null)
-        {
-            await _loopCancellation.CancelAsync().ConfigureAwait(false);
-            _loopCancellation.Dispose();
-            _loopCancellation = null;
-        }
+        _startVersion++;
+        StopFrameLoop();
 
         if (OperatingSystem.IsBrowser() && ScannerJsInterop.IsImported)
         {
@@ -881,5 +1335,7 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
         _decoder?.Dispose();
         _decoder = null;
         _frameBuffer = [];
+        _camera = null;
+        await Task.CompletedTask.ConfigureAwait(false);
     }
 }

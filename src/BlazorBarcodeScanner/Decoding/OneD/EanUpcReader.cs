@@ -126,11 +126,14 @@ public sealed class EanUpcReader : IRowDecoder
         var counters = _counters;
         var rowOffset = guardEnd;
         var end = row.Size;
+        var moduleWidth = (guardEnd - guardStart) / 3.0f;
         var lgPatternFound = 0;
 
         for (var x = 0; x < 6; x++)
         {
-            if (rowOffset >= end || !TryDecodeDigit(row, counters, rowOffset, LAndGPatterns, out var match))
+            if (rowOffset >= end ||
+                !TryDecodeDigit(row, counters, rowOffset, LAndGPatterns, out var match) ||
+                !IsDigitWidthPlausible(counters, moduleWidth))
             {
                 return null;
             }
@@ -151,7 +154,7 @@ public sealed class EanUpcReader : IRowDecoder
 
         result.Insert(0, (char)('0' + firstDigit));
 
-        if (!LinearPatterns.FindGuardPattern(row, rowOffset, true, MiddlePattern, _guardCounters, out _, out var middleEnd))
+        if (!TryMatchGuardAt(row, rowOffset, whiteFirst: true, MiddlePattern, out var middleEnd))
         {
             return null;
         }
@@ -159,7 +162,9 @@ public sealed class EanUpcReader : IRowDecoder
         rowOffset = middleEnd;
         for (var x = 0; x < 6; x++)
         {
-            if (rowOffset >= end || !TryDecodeDigit(row, counters, rowOffset, LPatterns, out var match))
+            if (rowOffset >= end ||
+                !TryDecodeDigit(row, counters, rowOffset, LPatterns, out var match) ||
+                !IsDigitWidthPlausible(counters, moduleWidth))
             {
                 return null;
             }
@@ -168,7 +173,7 @@ public sealed class EanUpcReader : IRowDecoder
             rowOffset += counters[0] + counters[1] + counters[2] + counters[3];
         }
 
-        if (!TryVerifyEndGuard(row, rowOffset, StartEndPattern, out var symbolEnd))
+        if (!TryVerifyEndGuard(row, rowOffset, whiteFirst: false, StartEndPattern, out var symbolEnd))
         {
             return null;
         }
@@ -203,10 +208,13 @@ public sealed class EanUpcReader : IRowDecoder
         var counters = _counters;
         var rowOffset = guardEnd;
         var end = row.Size;
+        var moduleWidth = (guardEnd - guardStart) / 3.0f;
 
         for (var x = 0; x < 4; x++)
         {
-            if (rowOffset >= end || !TryDecodeDigit(row, counters, rowOffset, LPatterns, out var match))
+            if (rowOffset >= end ||
+                !TryDecodeDigit(row, counters, rowOffset, LPatterns, out var match) ||
+                !IsDigitWidthPlausible(counters, moduleWidth))
             {
                 return null;
             }
@@ -215,7 +223,7 @@ public sealed class EanUpcReader : IRowDecoder
             rowOffset += counters[0] + counters[1] + counters[2] + counters[3];
         }
 
-        if (!LinearPatterns.FindGuardPattern(row, rowOffset, true, MiddlePattern, _guardCounters, out _, out var middleEnd))
+        if (!TryMatchGuardAt(row, rowOffset, whiteFirst: true, MiddlePattern, out var middleEnd))
         {
             return null;
         }
@@ -223,7 +231,9 @@ public sealed class EanUpcReader : IRowDecoder
         rowOffset = middleEnd;
         for (var x = 0; x < 4; x++)
         {
-            if (rowOffset >= end || !TryDecodeDigit(row, counters, rowOffset, LPatterns, out var match))
+            if (rowOffset >= end ||
+                !TryDecodeDigit(row, counters, rowOffset, LPatterns, out var match) ||
+                !IsDigitWidthPlausible(counters, moduleWidth))
             {
                 return null;
             }
@@ -232,7 +242,7 @@ public sealed class EanUpcReader : IRowDecoder
             rowOffset += counters[0] + counters[1] + counters[2] + counters[3];
         }
 
-        if (!TryVerifyEndGuard(row, rowOffset, StartEndPattern, out var symbolEnd))
+        if (!TryVerifyEndGuard(row, rowOffset, whiteFirst: false, StartEndPattern, out var symbolEnd))
         {
             return null;
         }
@@ -253,11 +263,14 @@ public sealed class EanUpcReader : IRowDecoder
         var counters = _counters;
         var rowOffset = guardEnd;
         var end = row.Size;
+        var moduleWidth = (guardEnd - guardStart) / 3.0f;
         var lgPatternFound = 0;
 
         for (var x = 0; x < 6; x++)
         {
-            if (rowOffset >= end || !TryDecodeDigit(row, counters, rowOffset, LAndGPatterns, out var match))
+            if (rowOffset >= end ||
+                !TryDecodeDigit(row, counters, rowOffset, LAndGPatterns, out var match) ||
+                !IsDigitWidthPlausible(counters, moduleWidth))
             {
                 return null;
             }
@@ -290,7 +303,7 @@ public sealed class EanUpcReader : IRowDecoder
         }
 
         // UPC-E ends with a six element guard rather than the three element guard of the others.
-        if (!LinearPatterns.FindGuardPattern(row, rowOffset, true, UpcEEndPattern, _guardCounters, out _, out var symbolEnd))
+        if (!TryVerifyEndGuard(row, rowOffset, whiteFirst: true, UpcEEndPattern, out var symbolEnd))
         {
             return null;
         }
@@ -367,16 +380,16 @@ public sealed class EanUpcReader : IRowDecoder
             [new ScanPoint(left, rowNumber), new ScanPoint(symbolEnd, rowNumber)]);
     }
 
-    private bool TryVerifyEndGuard(BitRow row, int rowOffset, int[] pattern, out int symbolEnd)
+    private bool TryVerifyEndGuard(BitRow row, int rowOffset, bool whiteFirst, int[] pattern, out int symbolEnd)
     {
         symbolEnd = 0;
-        if (!LinearPatterns.FindGuardPattern(row, rowOffset, false, pattern, _guardCounters, out var start, out var end))
+        if (!TryMatchGuardAt(row, rowOffset, whiteFirst, pattern, out var end))
         {
             return false;
         }
 
         // The symbol must be followed by a quiet zone at least as wide as the end guard itself.
-        var quietEnd = end + (end - start);
+        var quietEnd = end + (end - rowOffset);
         if (quietEnd > row.Size || !row.IsRange(end, quietEnd, false))
         {
             return false;
@@ -384,6 +397,51 @@ public sealed class EanUpcReader : IRowDecoder
 
         symbolEnd = end;
         return true;
+    }
+
+    /// <summary>
+    /// Matches a guard pattern that must begin exactly at <paramref name="rowOffset"/>.
+    /// </summary>
+    /// <remarks>
+    /// Searching forward for a guard, as the start guard search does, is right when nothing is
+    /// known about where the symbol is. Once digits have been read the next guard has to be the
+    /// very next run; accepting one further along lets a row of noise assemble a "symbol" out of
+    /// unrelated fragments, which is where nearly every EAN/UPC false positive comes from.
+    /// </remarks>
+    private bool TryMatchGuardAt(BitRow row, int rowOffset, bool whiteFirst, int[] pattern, out int end)
+    {
+        end = 0;
+        var counters = _guardCounters.AsSpan(0, pattern.Length);
+        if (rowOffset >= row.Size || row[rowOffset] == whiteFirst || !LinearPatterns.RecordPattern(row, rowOffset, counters))
+        {
+            return false;
+        }
+
+        if (LinearPatterns.PatternMatchVariance(counters, pattern, LinearPatterns.MaxIndividualVariance) >= LinearPatterns.MaxAvgVariance)
+        {
+            return false;
+        }
+
+        var total = 0;
+        foreach (var counter in counters)
+        {
+            total += counter;
+        }
+
+        end = rowOffset + total;
+        return true;
+    }
+
+    /// <summary>
+    /// Rejects a digit whose total width is inconsistent with the module width established by
+    /// the start guard. Every EAN/UPC digit is exactly seven modules wide.
+    /// </summary>
+    private static bool IsDigitWidthPlausible(ReadOnlySpan<int> counters, float moduleWidth)
+    {
+        var width = counters[0] + counters[1] + counters[2] + counters[3];
+        var expected = 7 * moduleWidth;
+        var tolerance = Math.Max(2.5f, expected * 0.45f);
+        return Math.Abs(width - expected) <= tolerance;
     }
 
     private bool TryFindStartGuard(BitRow row, int from, out int guardStart, out int guardEnd)

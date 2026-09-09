@@ -137,6 +137,22 @@ public sealed class BitRow
         return true;
     }
 
+    /// <summary>Inverts every bit, used to retry a light-on-dark linear symbol.</summary>
+    public void Invert()
+    {
+        var words = (Size + 31) >> 5;
+        for (var i = 0; i < words; i++)
+        {
+            _bits[i] = ~_bits[i];
+        }
+
+        var trailing = Size & 31;
+        if (trailing != 0)
+        {
+            _bits[words - 1] &= (1u << trailing) - 1;
+        }
+    }
+
     /// <summary>
     /// Reverses the row in place, used to read a linear symbol that was scanned right to left.
     /// </summary>

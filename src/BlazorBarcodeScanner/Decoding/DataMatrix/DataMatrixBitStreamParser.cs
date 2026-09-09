@@ -63,6 +63,7 @@ public static class DataMatrixBitStreamParser
         Edifact,
         Base256,
         Pad,
+        Invalid,
     }
 
     /// <summary>Decodes the payload.</summary>
@@ -101,6 +102,11 @@ public static class DataMatrixBitStreamParser
                         break;
                     }
 
+                    if (mode == Mode.Invalid)
+                    {
+                        return null;
+                    }
+
                     continue;
                 }
 
@@ -134,8 +140,13 @@ public static class DataMatrixBitStreamParser
             result.Append(trailer);
         }
 
-        var text = result.ToString();
-        return new DecoderResult(CharacterSetEci.Latin1.GetBytes(text), text)
+        // Every character appended so far stands for one payload byte, so the Latin-1 round trip
+        // recovers the raw bytes exactly; the text is then interpreted in the declared or
+        // guessed character set.
+        var rawBytes = CharacterSetEci.Latin1.GetBytes(result.ToString());
+        var encoding = eci is int declared ? CharacterSetEci.FromEci(declared) : CharacterSetEci.GuessEncoding(rawBytes);
+        var text = encoding.GetString(rawBytes);
+        return new DecoderResult(rawBytes, text)
         {
             SymbolVersion = version.ToString(),
             ErrorsCorrected = errorsCorrected,
@@ -160,13 +171,21 @@ public static class DataMatrixBitStreamParser
         ref int? eci)
     {
         var upperShift = false;
+        var codewordsRead = 0;
+        var previousWasStructuredAppend = false;
 
         do
         {
             var value = bits.ReadBits(8);
+            codewordsRead++;
+            var wasFirst = codewordsRead == 1 && result.Length == 0;
+            var afterStructuredAppend = previousWasStructuredAppend;
+            previousWasStructuredAppend = false;
+
             if (value == 0)
             {
-                return Mode.Pad;
+                // Codeword 0 is not defined by the specification.
+                return Mode.Invalid;
             }
 
             if (value <= 128)
@@ -213,20 +232,30 @@ public static class DataMatrixBitStreamParser
                 case LatchEdifact:
                     return Mode.Edifact;
                 case Fnc1:
-                    isGs1 = true;
-                    if (result.Length > 0)
+                    // FNC1 in the first position (or second, after a structured append header)
+                    // declares a GS1 stream; anywhere else it is a group separator.
+                    if (wasFirst || afterStructuredAppend)
+                    {
+                        isGs1 = true;
+                    }
+                    else
                     {
                         result.Append((char)29);
                     }
 
                     break;
                 case StructuredAppend:
-                    if (bits.Available >= 24)
+                    if (bits.Available < 24)
+                    {
+                        return Mode.Invalid;
+                    }
+
                     {
                         var sequence = bits.ReadBits(8);
                         structuredAppendIndex = (sequence >> 4) + 1;
-                        structuredAppendCount = (sequence & 0x0F) + 2;
+                        structuredAppendCount = 17 - (sequence & 0x0F);
                         structuredAppendParity = bits.ReadBits(16);
+                        previousWasStructuredAppend = true;
                     }
 
                     break;
@@ -238,29 +267,74 @@ public static class DataMatrixBitStreamParser
                 case Macro05:
                 case Macro06:
                     // The macro codewords stand for a fixed header and trailer around the payload.
-                    result.Append(value == Macro05 ? "[)>05" : "[)>06");
-                    trailer.Insert(0, "");
+                    result.Append(value == Macro05 ? "[)>\u001E05\u001D" : "[)>\u001E06\u001D");
+                    trailer.Insert(0, "\u001E\u0004");
                     break;
                 case Eci:
-                    if (bits.Available >= 8)
+                    if (!TryReadEci(ref bits, out var assignment))
                     {
-                        eci = bits.ReadBits(8) - 1;
+                        return Mode.Invalid;
+                    }
+
+                    eci = assignment;
+                    break;
+                case 254:
+                    // The unlatch codeword is only legal as the very last one.
+                    if (bits.Available != 0)
+                    {
+                        return Mode.Invalid;
                     }
 
                     break;
                 default:
-                    // 254 is the unlatch codeword and is only legal as the very last one.
-                    if (value != 254 || bits.Available != 0)
-                    {
-                        return Mode.Pad;
-                    }
-
-                    break;
+                    // 242 to 253 and 255 are reserved; a stream that contains them is corrupt.
+                    return Mode.Invalid;
             }
         }
         while (bits.Available > 0);
 
         return Mode.Ascii;
+    }
+
+    /// <summary>
+    /// Reads an ECI assignment number, which spans one, two or three codewords depending on its
+    /// magnitude (ISO/IEC 16022 5.2.4.11).
+    /// </summary>
+    private static bool TryReadEci(ref BitSource bits, out int eci)
+    {
+        eci = 0;
+        if (bits.Available < 8)
+        {
+            return false;
+        }
+
+        var first = bits.ReadBits(8);
+        if (first <= 127)
+        {
+            eci = first - 1;
+            return true;
+        }
+
+        if (first <= 191)
+        {
+            if (bits.Available < 8)
+            {
+                return false;
+            }
+
+            eci = ((first - 128) * 254) + bits.ReadBits(8) - 1 + 127;
+            return true;
+        }
+
+        if (bits.Available < 16)
+        {
+            return false;
+        }
+
+        var second = bits.ReadBits(8);
+        var third = bits.ReadBits(8);
+        eci = ((first - 192) * 64516) + ((second - 1) * 254) + third - 1 + 16383;
+        return true;
     }
 
     private static bool DecodeC40OrText(ref BitSource bits, StringBuilder result, bool text)

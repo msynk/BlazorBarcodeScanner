@@ -1,3 +1,4 @@
+using BlazorBarcodeScanner.Decoding.Common;
 using BlazorBarcodeScanner.Imaging;
 
 namespace BlazorBarcodeScanner.Decoding.QrCode;
@@ -8,6 +9,22 @@ namespace BlazorBarcodeScanner.Decoding.QrCode;
 public sealed class QrCodeReader : IMatrixDecoder
 {
     private readonly QrDecoder _decoder = new();
+    private readonly Func<DetectorResult, bool> _accept;
+    private QrDetector? _detector;
+    private DecoderResult? _payload;
+
+    /// <summary>Creates a reader.</summary>
+    public QrCodeReader()
+    {
+        // Cached once: a lambda here would allocate a closure and a delegate on every frame.
+        _accept = AcceptCandidate;
+    }
+
+    private bool AcceptCandidate(DetectorResult candidate)
+    {
+        _payload = _decoder.Decode(candidate.Bits);
+        return _payload is not null;
+    }
 
     /// <inheritdoc />
     public BarcodeFormat Formats => BarcodeFormat.QrCode;
@@ -43,13 +60,20 @@ public sealed class QrCodeReader : IMatrixDecoder
 
     private SymbolDecodeResult? TryDecode(BitMatrix image, bool tryHarder)
     {
-        using var detected = new QrDetector(image).Detect(tryHarder);
-        if (detected is null)
+        if (_detector is null)
         {
-            return null;
+            _detector = new QrDetector(image);
+        }
+        else
+        {
+            _detector.Reset(image);
         }
 
-        var payload = _decoder.Decode(detected.Bits);
-        return payload is null ? null : new SymbolDecodeResult(payload, BarcodeFormat.QrCode, detected.Points);
+        _payload = null;
+        using var detected = _detector.Detect(tryHarder, _accept);
+
+        return detected is null || _payload is null
+            ? null
+            : new SymbolDecodeResult(_payload, BarcodeFormat.QrCode, detected.Points);
     }
 }

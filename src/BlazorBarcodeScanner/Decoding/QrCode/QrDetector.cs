@@ -8,7 +8,8 @@ namespace BlazorBarcodeScanner.Decoding.QrCode;
 /// </summary>
 public sealed class QrDetector
 {
-    private readonly BitMatrix _image;
+    private readonly QrFinderPatternFinder _finder = new();
+    private BitMatrix _image;
 
     /// <summary>Creates a detector over a binarised image.</summary>
     /// <param name="image">The binarised image.</param>
@@ -18,13 +19,51 @@ public sealed class QrDetector
         _image = image;
     }
 
+    /// <summary>
+    /// Points an existing detector at another image, so that continuous scanning reuses one
+    /// instance and its finder rather than allocating a pair per frame.
+    /// </summary>
+    /// <param name="image">The binarised image.</param>
+    public void Reset(BitMatrix image)
+    {
+        ArgumentNullException.ThrowIfNull(image);
+        _image = image;
+    }
+
     /// <summary>Detects and samples a symbol.</summary>
     /// <param name="tryHarder">When <see langword="true"/> the finder pattern search scans every row.</param>
     /// <returns>The sampled grid and its corner points, or <see langword="null"/> when no symbol is found.</returns>
-    public DetectorResult? Detect(bool tryHarder)
+    public DetectorResult? Detect(bool tryHarder) => Detect(tryHarder, static _ => true);
+
+    /// <summary>
+    /// Detects and samples a symbol, offering each candidate grid to <paramref name="accept"/>
+    /// until one is taken.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Two of the three inputs to the sampling grid are estimates, and both are wrong often
+    /// enough to matter on real camera frames. The alignment pattern search can lock onto an
+    /// isolated data module, which shears the whole grid; and the dimension, derived from the
+    /// measured module size, drifts by a few modules on large symbols where a two per cent
+    /// error is worth four modules.
+    /// </para>
+    /// <para>
+    /// Rather than commit to one guess, the detector produces the candidates in order of
+    /// likelihood: with the alignment pattern, without it, and at the dimension the symbol's own
+    /// version information declares. A grid whose timing patterns do not alternate is discarded
+    /// before the caller ever sees it, which costs one pass over two lines of modules and
+    /// removes almost every wrong grid.
+    /// </para>
+    /// </remarks>
+    /// <param name="tryHarder">When <see langword="true"/> the finder pattern search scans every row.</param>
+    /// <param name="accept">Called with each candidate; returning <see langword="true"/> ends the search.</param>
+    /// <returns>The accepted result, or <see langword="null"/>. Rejected candidates are disposed.</returns>
+    public DetectorResult? Detect(bool tryHarder, Func<DetectorResult, bool> accept)
     {
-        var finder = new QrFinderPatternFinder(_image);
-        if (!finder.TryFind(tryHarder, out var patterns))
+        ArgumentNullException.ThrowIfNull(accept);
+
+        _finder.Reset(_image);
+        if (!_finder.TryFind(tryHarder, out var patterns))
         {
             return null;
         }
@@ -33,8 +72,10 @@ public sealed class QrDetector
         var topLeft = patterns[1];
         var topRight = patterns[2];
 
+        // Written this way so that a NaN, which every comparison answers false to, is rejected
+        // rather than carried into the dimension estimate.
         var moduleSize = CalculateModuleSize(topLeft, topRight, bottomLeft);
-        if (moduleSize < 1.0f)
+        if (!(moduleSize >= 1.0f))
         {
             return null;
         }
@@ -50,30 +91,81 @@ public sealed class QrDetector
             return null;
         }
 
-        QrFinderPattern? alignmentPattern = null;
-        if (provisionalVersion.AlignmentPatternCenters.Length > 0)
+        var alignmentPattern = provisionalVersion.AlignmentPatternCenters.Length > 0
+            ? FindAlignment(topLeft, topRight, bottomLeft, provisionalVersion, moduleSize)
+            : null;
+
+        // Preferred first: the alignment pattern corrects for perspective when it is real.
+        if (alignmentPattern is not null &&
+            TryCandidate(topLeft, topRight, bottomLeft, alignmentPattern, dimension, accept) is { } withAlignment)
         {
-            var modulesBetweenCenters = provisionalVersion.DimensionForVersion - 7;
+            return withAlignment;
+        }
 
-            // The fourth corner of the parallelogram formed by the three finder patterns is where
-            // the bottom-right of the symbol falls; the alignment pattern sits three modules in.
-            var bottomRightX = topRight.X - topLeft.X + bottomLeft.X;
-            var bottomRightY = topRight.Y - topLeft.Y + bottomLeft.Y;
-            var correction = 1.0f - (3.0f / modulesBetweenCenters);
-            var estimatedX = (int)(topLeft.X + (correction * (bottomRightX - topLeft.X)));
-            var estimatedY = (int)(topLeft.Y + (correction * (bottomRightY - topLeft.Y)));
+        // The affine grid, which ignores the alignment pattern entirely. This is the one that
+        // works when the alignment search found noise.
+        if (TryCandidate(topLeft, topRight, bottomLeft, null, dimension, accept) is { } affine)
+        {
+            return affine;
+        }
 
-            // Widen the search until it succeeds; a tight region is much cheaper when it works.
-            for (var allowance = 4; allowance <= 16; allowance <<= 1)
+        // Finally, let the symbol say how big it is. Version information is only present from
+        // version 7 up, which is exactly where the dimension estimate becomes unreliable.
+        if (dimension < 45)
+        {
+            return null;
+        }
+
+        Span<int> candidates = stackalloc int[DimensionDeltas.Length];
+        var count = NearbyDimensions(dimension, candidates);
+        for (var i = 0; i < count; i++)
+        {
+            var candidateDimension = candidates[i];
+            if (alignmentPattern is not null &&
+                TryCandidate(topLeft, topRight, bottomLeft, alignmentPattern, candidateDimension, accept) is { } resized)
             {
-                alignmentPattern = FindAlignmentInRegion(moduleSize, estimatedX, estimatedY, allowance);
-                if (alignmentPattern is not null)
-                {
-                    break;
-                }
+                return resized;
+            }
+
+            if (TryCandidate(topLeft, topRight, bottomLeft, null, candidateDimension, accept) is { } resizedAffine)
+            {
+                return resizedAffine;
             }
         }
 
+        return null;
+    }
+
+    /// <summary>Offsets from the estimated dimension to retry, nearest first.</summary>
+    private static readonly int[] DimensionDeltas = [4, -4, 8, -8];
+
+    /// <summary>
+    /// Writes the legal dimensions within eight modules of the estimate into
+    /// <paramref name="candidates"/>, nearest first, and returns how many there are.
+    /// </summary>
+    private static int NearbyDimensions(int dimension, Span<int> candidates)
+    {
+        var count = 0;
+        foreach (var delta in DimensionDeltas)
+        {
+            var candidate = dimension + delta;
+            if (candidate is >= 21 and <= 177 && QrVersion.GetProvisionalVersionForDimension(candidate) is not null)
+            {
+                candidates[count++] = candidate;
+            }
+        }
+
+        return count;
+    }
+
+    private DetectorResult? TryCandidate(
+        QrFinderPattern topLeft,
+        QrFinderPattern topRight,
+        QrFinderPattern bottomLeft,
+        QrFinderPattern? alignmentPattern,
+        int dimension,
+        Func<DetectorResult, bool> accept)
+    {
         var transform = CreateTransform(topLeft, topRight, bottomLeft, alignmentPattern, dimension);
         var bits = GridSampler.Sample(_image, dimension, dimension, transform);
         if (bits is null)
@@ -81,11 +173,99 @@ public sealed class QrDetector
             return null;
         }
 
+        if (!HasPlausibleTimingPatterns(bits))
+        {
+            bits.Dispose();
+            return null;
+        }
+
         ScanPoint[] points = alignmentPattern is null
             ? [bottomLeft.Point, topLeft.Point, topRight.Point]
             : [bottomLeft.Point, topLeft.Point, topRight.Point, alignmentPattern.Point];
 
-        return new DetectorResult(bits, points);
+        var result = new DetectorResult(bits, points);
+        if (accept(result))
+        {
+            return result;
+        }
+
+        result.Dispose();
+        return null;
+    }
+
+    /// <summary>
+    /// Checks the two timing patterns of a sampled grid, the alternating row and column at
+    /// index 6 between the finder patterns.
+    /// </summary>
+    /// <remarks>
+    /// A grid sampled through a wrong transform is essentially random there, while a correctly
+    /// sampled one is exact. Allowing a fifth of the modules to be wrong keeps damaged and
+    /// blurred symbols while rejecting sheared grids, which typically get half of them wrong.
+    /// </remarks>
+    private static bool HasPlausibleTimingPatterns(BitMatrix bits)
+    {
+        var dimension = bits.Width;
+        if (dimension < 21)
+        {
+            return false;
+        }
+
+        var errors = 0;
+        var checked_ = 0;
+        for (var i = 8; i < dimension - 8; i++)
+        {
+            var expected = (i & 1) == 0;
+            checked_ += 2;
+            if (bits[i, 6] != expected)
+            {
+                errors++;
+            }
+
+            if (bits[6, i] != expected)
+            {
+                errors++;
+            }
+        }
+
+        // A fifth of the modules may be wrong, but never fewer than four in absolute terms: the
+        // timing pattern is the finest detail in the symbol and degrades before the data does,
+        // and a version 1 symbol only offers ten modules to check.
+        return checked_ > 0 && (errors * 5 <= checked_ || errors <= 4);
+    }
+
+    private QrFinderPattern? FindAlignment(
+        QrFinderPattern topLeft,
+        QrFinderPattern topRight,
+        QrFinderPattern bottomLeft,
+        QrVersion provisionalVersion,
+        float moduleSize)
+    {
+        var modulesBetweenCenters = provisionalVersion.DimensionForVersion - 7;
+
+        // The fourth corner of the parallelogram formed by the three finder patterns is where
+        // the bottom-right of the symbol falls; the alignment pattern sits three modules in.
+        var bottomRightX = topRight.X - topLeft.X + bottomLeft.X;
+        var bottomRightY = topRight.Y - topLeft.Y + bottomLeft.Y;
+        var correction = 1.0f - (3.0f / modulesBetweenCenters);
+        var estimatedX = (int)(topLeft.X + (correction * (bottomRightX - topLeft.X)));
+        var estimatedY = (int)(topLeft.Y + (correction * (bottomRightY - topLeft.Y)));
+
+        // Widen the search until it succeeds; a tight region is much cheaper when it works.
+        for (var allowance = 4; allowance <= 16; allowance <<= 1)
+        {
+            var found = FindAlignmentInRegion(moduleSize, estimatedX, estimatedY, allowance);
+            if (found is null)
+            {
+                continue;
+            }
+
+            // A pattern further from the estimate than the search that found it is a false
+            // sighting; using it would shear the grid far worse than ignoring it.
+            var drift = MathUtils.Distance(found.X, found.Y, estimatedX, estimatedY);
+            return drift <= Math.Max(4f * moduleSize, allowance * moduleSize * 0.75f) ? found : null;
+        }
+
+        return null;
     }
 
     private static PerspectiveTransform CreateTransform(

@@ -96,6 +96,12 @@ internal static partial class ScannerJsInterop
     [JSImport("describe", ModuleName)]
     internal static partial string Describe(string sessionId);
 
+    [JSImport("getViewSize", ModuleName)]
+    internal static partial int GetViewSize(string sessionId);
+
+    [JSImport("pollChanges", ModuleName)]
+    internal static partial int PollChanges(string sessionId);
+
     [JSImport("stop", ModuleName)]
     internal static partial void Stop(string sessionId);
 

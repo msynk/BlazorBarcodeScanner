@@ -7,7 +7,9 @@
  * without any extra work.
  */
 
-.bscan {
+/* Defaults live in a zero specificity block so that any rule an application writes, whatever
+   its order in the document, wins over them. */
+:where(.bscan) {
     --bscan-radius: 0.75rem;
     --bscan-bg: #0b0d12;
     --bscan-fg: #f5f7fa;
@@ -27,12 +29,16 @@
     --bscan-font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     --bscan-gap: 0.5rem;
     --bscan-transition: 160ms ease;
+}
 
+.bscan {
     position: relative;
     display: block;
     inline-size: 100%;
     max-inline-size: 100%;
-    aspect-ratio: 4 / 3;
+    /* The component sets --bscan-aspect to the camera's negotiated ratio once it is open, so
+       nothing is cropped and overlays line up with the frame exactly. */
+    aspect-ratio: var(--bscan-aspect, 4 / 3);
     overflow: hidden;
     border-radius: var(--bscan-radius);
     background: var(--bscan-bg);
@@ -53,6 +59,7 @@
     block-size: 100%;
     object-fit: cover;
     background: #000;
+    forced-color-adjust: none;
 }
 
 .bscan__video[data-mirrored="true"] {
@@ -67,6 +74,7 @@
     background: var(--bscan-overlay);
     pointer-events: none;
     transition: clip-path var(--bscan-transition);
+    forced-color-adjust: none;
 }
 
 .bscan__reticle {
@@ -127,7 +135,9 @@
         animation: none;
     }
 
-    .bscan__mask {
+    .bscan__mask,
+    .bscan__hit,
+    .bscan__button {
         transition: none;
     }
 }
@@ -142,9 +152,10 @@
     block-size: var(--bscan-hit-height, 0);
     border: 2px solid var(--bscan-success);
     border-radius: 0.35rem;
-    box-shadow: 0 0 0 9999px transparent;
     pointer-events: none;
-    transition: all var(--bscan-transition);
+    transition: inset-block-start var(--bscan-transition), inset-inline-start var(--bscan-transition),
+        inline-size var(--bscan-transition), block-size var(--bscan-transition);
+    forced-color-adjust: none;
 }
 
 .bscan__controls {
@@ -181,8 +192,11 @@
     background: var(--bscan-control-hover-bg);
 }
 
+/* A transparent outline is invisible normally but becomes a system colour under forced
+   colours, where box shadows are dropped. */
 .bscan__button:focus-visible {
-    outline: none;
+    outline: 2px solid transparent;
+    outline-offset: 2px;
     box-shadow: var(--bscan-focus-ring);
 }
 
@@ -206,8 +220,10 @@
     font-size: 0.875rem;
 }
 
-.bscan__select:focus-visible {
-    outline: none;
+.bscan__select:focus-visible,
+.bscan__range:focus-visible {
+    outline: 2px solid transparent;
+    outline-offset: 2px;
     box-shadow: var(--bscan-focus-ring);
 }
 
@@ -287,7 +303,18 @@
         border-color: CanvasText;
     }
 
-    .bscan__button {
+    .bscan__hit {
+        border-color: Highlight;
+    }
+
+    .bscan__button,
+    .bscan__select {
         border: 1px solid ButtonText;
+    }
+
+    .bscan__button:focus-visible,
+    .bscan__select:focus-visible,
+    .bscan__range:focus-visible {
+        outline-color: Highlight;
     }
 }

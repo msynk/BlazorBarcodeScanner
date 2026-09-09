@@ -10,9 +10,11 @@
 
 <div class="split">
     <div class="stack">
+    <div style="@(_fill ? "block-size:22rem;" : null)">
         <BarcodeScanner @ref="_scanner"
                         Formats="_formats"
                         Region="_region"
+                        Options="_options"
                         TargetFrameRate="_frameRate"
                         MaxProcessingSize="_processingSize"
                         DuplicateSuppressionWindow="TimeSpan.FromSeconds(_duplicateSeconds)"
@@ -24,14 +26,28 @@
                         HighlightResults="_highlight"
                         EnableFileScanning="true"
                         AutoStart="true"
+                        Fill="_fill"
                         OnScan="HandleScan"
                         OnError="HandleError"
                         OnStatusChanged="HandleStatus"
-                        OnDiagnostics="HandleDiagnostics" />
+                        OnDiagnostics="HandleDiagnostics">
+            <ControlsContent>
+                @* Appended to the built-in control bar. *@
+                <button type="button" class="bscan__button" @onclick="() => _results.Clear()">Clear log</button>
+            </ControlsContent>
+            <ChildContent>
+                @* Arbitrary content on top of the viewfinder. *@
+                @if (_lastFormat is not null)
+                {
+                    <div class="scan-badge">@_lastFormat</div>
+                }
+            </ChildContent>
+        </BarcodeScanner>
+    </div>
 
         <DiagnosticsPanel Diagnostics="_diagnostics"
-                          FramesDecoded="_framesDecoded"
-                          FramesWithSymbol="_framesWithSymbol" />
+                          FramesDecoded="_scanner?.FramesDecoded ?? 0"
+                          FramesWithSymbol="_scanner?.FramesWithSymbol ?? 0" />
     </div>
 
     <div class="stack">
@@ -105,12 +121,77 @@
         </div>
 
         <div class="card">
+            <h3 style="margin-block-start:0;">Advanced tuning</h3>
+            <p class="field__hint">
+                Everything here is a property of <code>ScannerOptions</code>, passed through the
+                <code>Options</code> parameter. <code>Formats</code> and <code>Region</code> are
+                still applied on top of it.
+            </p>
+
+            <div class="field">
+                <label class="field__label" for="lines">Scan lines per orientation: @_options.MaxScanLines</label>
+                <input id="lines" type="range" min="1" max="60" step="1"
+                       value="@_options.MaxScanLines" @onchange="e => Tune(o => o.MaxScanLines = ToInt(e, 15))" />
+                <span class="field__hint">How many lines each orientation gets when looking for linear symbols.</span>
+            </div>
+
+            <div class="field">
+                <label class="field__label" for="downsample">Downsample factor: @_options.DownsampleFactor</label>
+                <input id="downsample" type="range" min="1" max="4" step="1"
+                       value="@_options.DownsampleFactor" @onchange="e => Tune(o => o.DownsampleFactor = ToInt(e, 1))" />
+                <span class="field__hint">Subsamples while converting to grayscale. Quadratic, and costs the smallest readable symbol.</span>
+            </div>
+
+            <label class="checkbox">
+                <input type="checkbox" checked="@_options.TryHarder"
+                       @onchange="e => Tune(o => o.TryHarder = (bool)(e.Value ?? false))" />
+                Try harder (exhaustive detection and the full rotation sweep)
+            </label>
+            <label class="checkbox">
+                <input type="checkbox" checked="@_options.AllowInverted"
+                       @onchange="e => Tune(o => o.AllowInverted = (bool)(e.Value ?? false))" />
+                Allow inverted (light on dark) symbols
+            </label>
+            <label class="checkbox">
+                <input type="checkbox" checked="@_options.TryReversedRows"
+                       @onchange="e => Tune(o => o.TryReversedRows = (bool)(e.Value ?? false))" />
+                Read linear symbols right to left as well
+            </label>
+            <label class="checkbox">
+                <input type="checkbox" checked="@_options.TryVerticalLines"
+                       @onchange="e => Tune(o => o.TryVerticalLines = (bool)(e.Value ?? false))" />
+                Scan columns and tilted lines, for rotated linear symbols
+            </label>
+            <label class="checkbox">
+                <input type="checkbox" checked="@_options.Code39CheckDigit"
+                       @onchange="e => Tune(o => o.Code39CheckDigit = (bool)(e.Value ?? false))" />
+                Require the Code 39 modulo 43 check character
+            </label>
+            <label class="checkbox">
+                <input type="checkbox" checked="@_options.Code39ExtendedMode"
+                       @onchange="e => Tune(o => o.Code39ExtendedMode = (bool)(e.Value ?? false))" />
+                Interpret Code 39 as full ASCII
+            </label>
+
+            <div class="field" style="margin-block-start:0.75rem;">
+                <label class="field__label" for="itf">Accepted ITF lengths</label>
+                <select id="itf" value="@_itfLengths" @onchange="OnItfLengthsChanged">
+                    <option value="default">6 to 20, even (default)</option>
+                    <option value="14">14 only (ITF-14)</option>
+                    <option value="any">Any even length</option>
+                </select>
+                <span class="field__hint">ITF has no check character, so its accepted lengths are the main guard against a truncated read.</span>
+            </div>
+        </div>
+
+        <div class="card">
             <h3 style="margin-block-start:0;">Chrome</h3>
             <label class="checkbox"><input type="checkbox" checked="@_showControls" @onchange="e => _showControls = (bool)(e.Value ?? true)" /> Built-in controls</label>
             <label class="checkbox"><input type="checkbox" checked="@_showStatus" @onchange="e => _showStatus = (bool)(e.Value ?? true)" /> Status bar</label>
             <label class="checkbox"><input type="checkbox" checked="@_showReticle" @onchange="e => _showReticle = (bool)(e.Value ?? true)" /> Reticle</label>
             <label class="checkbox"><input type="checkbox" checked="@_showMask" @onchange="e => _showMask = (bool)(e.Value ?? true)" /> Dim outside the region</label>
             <label class="checkbox"><input type="checkbox" checked="@_highlight" @onchange="e => _highlight = (bool)(e.Value ?? true)" /> Highlight decoded symbol</label>
+            <label class="checkbox"><input type="checkbox" checked="@_fill" @onchange="e => _fill = (bool)(e.Value ?? false)" /> Fill the parent instead of keeping the camera's aspect ratio</label>
         </div>
 
         <div class="card">
@@ -146,6 +227,36 @@
 </div>
 
 @code {
+    private ScannerOptions _options = new();
+    private string _itfLengths = "default";
+    private bool _fill;
+    private string? _lastFormat;
+
+    /// <summary>
+    /// Options are cloned before every edit, so the running decoder is reconfigured by a new
+    /// instance rather than mutated underneath itself.
+    /// </summary>
+    private void Tune(Action<ScannerOptions> edit)
+    {
+        var next = _options.Clone();
+        edit(next);
+        next.Validate();
+        _options = next;
+    }
+
+    private void OnItfLengthsChanged(ChangeEventArgs args)
+    {
+        _itfLengths = args.Value?.ToString() ?? "default";
+        IReadOnlyCollection<int> lengths = _itfLengths switch
+        {
+            "14" => [14],
+            "any" => [],
+            _ => [6, 8, 10, 12, 14, 16, 18, 20],
+        };
+
+        Tune(o => o.ItfLengths = lengths);
+    }
+
     private static readonly BarcodeFormat[] Formats =
     [
         BarcodeFormat.QrCode, BarcodeFormat.DataMatrix, BarcodeFormat.Code128, BarcodeFormat.Code39,
@@ -162,8 +273,6 @@
     private CameraFacing _facing = CameraFacing.Rear;
     private ScanDiagnostics _diagnostics;
     private ScannerException? _error;
-    private long _framesDecoded;
-    private long _framesWithSymbol;
 
     private int _frameRate = 15;
     private int _processingSize = 640;
@@ -176,6 +285,7 @@
 
     private void HandleScan(BarcodeResult result)
     {
+        _lastFormat = result.Format.ToString();
         _results.Insert(0, result);
         if (_results.Count > 40)
         {
@@ -204,11 +314,6 @@
     private void HandleDiagnostics(ScanDiagnostics diagnostics)
     {
         _diagnostics = diagnostics;
-        _framesDecoded++;
-        if (diagnostics.Decoded)
-        {
-            _framesWithSymbol++;
-        }
 
         StateHasChanged();
     }

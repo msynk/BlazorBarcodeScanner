@@ -26,8 +26,14 @@
             </p>
             <div class="button-row">
                 <button class="button button--primary" type="button" @onclick="OpenPicker">Choose an image</button>
+                <button class="button" type="button" @onclick="DecodeGeneratedImage">Decode a generated image</button>
                 <button class="button" type="button" @onclick="() => _results.Clear()" disabled="@(_results.Count == 0)">Clear</button>
             </div>
+            <p class="field__hint" style="margin-block-start:0.6rem;">
+                The second button skips the picker entirely: it renders a symbol into a pixel
+                buffer and hands it to <code>DecodeImage</code>, which is the path an application
+                uses when it sources images itself.
+            </p>
         </div>
 
         @if (_error is not null)
@@ -69,6 +75,40 @@ var result = decoder.Decode(pixels, width, height, PixelFormat.Rgba32);</code></
 </div>
 
 @code {
+    /// <summary>
+    /// Decodes a buffer the page owns, through <see cref="BarcodeScanner.DecodeImage"/>. No
+    /// camera and no file picker are involved.
+    /// </summary>
+    private void DecodeGeneratedImage()
+    {
+        _error = null;
+
+        var sample = SampleCatalog.All.First(s => s.Format == BarcodeFormat.QrCode);
+        using var image = BlazorBarcodeScanner.TestKit.SyntheticImage.FromMatrix(sample.Matrix!, scale: 6);
+
+        // Expand to the packed RGBA an application would normally get from a canvas.
+        var rgba = new byte[image.Width * image.Height * 4];
+        for (var i = 0; i < image.Width * image.Height; i++)
+        {
+            rgba[(i * 4) + 0] = image.Pixels[i];
+            rgba[(i * 4) + 1] = image.Pixels[i];
+            rgba[(i * 4) + 2] = image.Pixels[i];
+            rgba[(i * 4) + 3] = 255;
+        }
+
+        var result = _scanner?.DecodeImage(
+            rgba, image.Width, image.Height, BlazorBarcodeScanner.Imaging.PixelFormat.Rgba32);
+
+        if (result is not null)
+        {
+            _results.Insert(0, result);
+        }
+        else
+        {
+            _error = new ScannerException(ScannerErrorKind.Unknown, "The generated image did not decode.");
+        }
+    }
+
     private readonly List<BarcodeResult> _results = [];
     private BarcodeScanner? _scanner;
     private ScannerException? _error;

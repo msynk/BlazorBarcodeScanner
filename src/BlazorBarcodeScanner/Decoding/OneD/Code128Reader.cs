@@ -326,9 +326,18 @@ public sealed class Code128Reader : IRowDecoder
         }
 
         // The stop character has seven elements rather than six, so the loop above stopped one
-        // element short. Require the usual quiet zone after that final element.
+        // element short: the final element is a two module bar. Check it, then require the
+        // usual quiet zone after it.
         var quietStart = row.GetNextUnset(nextStart);
-        if (!row.IsRange(quietStart, Math.Min(row.Size, quietStart + ((quietStart - lastStart) / 2)), false))
+        var module = lastPatternSize / 11.0f;
+        var terminationBar = quietStart - nextStart;
+        if (terminationBar < module * 1.2f || terminationBar > module * 3.2f)
+        {
+            return null;
+        }
+
+        if (quietStart >= row.Size ||
+            !row.IsRange(quietStart, Math.Min(row.Size, quietStart + ((quietStart - lastStart) / 2)), false))
         {
             return null;
         }
@@ -336,11 +345,6 @@ public sealed class Code128Reader : IRowDecoder
         // The penultimate code is the modulo 103 check character, so remove its contribution.
         checksumTotal -= multiplier * lastCode;
         if (checksumTotal % 103 != lastCode)
-        {
-            return null;
-        }
-
-        if (result.Length == 0)
         {
             return null;
         }
@@ -355,6 +359,11 @@ public sealed class Code128Reader : IRowDecoder
             }
 
             result.Length -= checkCharacterLength;
+        }
+
+        if (result.Length == 0)
+        {
+            return null;
         }
 
         var text = result.ToString();

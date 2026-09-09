@@ -1,12 +1,13 @@
 @namespace BlazorBarcodeScanner
 @implements IAsyncDisposable
 
-<div class="bscan @CssClass"
+<div @attributes="AdditionalAttributes"
+     class="@RootClass()"
+     style="@RootStyle()"
      data-status="@_status.ToString().ToLowerInvariant()"
      data-fill="@(Fill ? "contain" : "aspect")"
      role="region"
-     aria-label="@AriaLabel"
-     @attributes="AdditionalAttributes">
+     aria-label="@AriaLabel">
 
     <video id="@_videoElementId"
            class="bscan__video"

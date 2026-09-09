@@ -10,13 +10,17 @@
 
 <div class="split">
     <div class="stack">
-        <div style="@ThemeStyle()">
-            <BarcodeScanner Formats="BarcodeFormat.All"
-                            Region="ScanRegion.CenteredSquare(0.72)"
-                            ShowControls="_showControls"
-                            Overlay="CurrentOverlay"
-                            OnScan="r => _last = r" />
-        </div>
+@* The custom properties are set on the scanner itself, through the unmatched attribute
+   capture, because a declaration on the element always beats one inherited from an ancestor. *@
+        <BarcodeScanner Formats="BarcodeFormat.All"
+                        Region="ScanRegion.CenteredSquare(0.72)"
+                        ShowControls="_showControls"
+                        CssClass="demo-scanner"
+                        AriaLabel="Customisable barcode scanner"
+                        Overlay="CurrentOverlay"
+                        MessageTemplate="MessageTemplate"
+                        style="@ThemeStyle()"
+                        OnScan="r => _last = r" />
 
         @if (_last is not null)
         {
@@ -129,6 +133,9 @@
 </p>
 
 @code {
+    private readonly RenderFragment<string> MessageTemplate = message =>
+        @<span class="demo-message">@message</span>;
+
     private enum OverlayStyle
     {
         Default,

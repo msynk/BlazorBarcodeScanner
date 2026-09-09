@@ -64,31 +64,6 @@ public static class LinearPatterns
         return counterPosition == counters.Length || (counterPosition == counters.Length - 1 && i == end);
     }
 
-    /// <summary>Measures runs walking backwards from <paramref name="start"/>.</summary>
-    /// <param name="row">The binarised scan line.</param>
-    /// <param name="start">Index to start measuring from, exclusive.</param>
-    /// <param name="counters">Receives the run widths, in left to right order.</param>
-    public static bool RecordPatternInReverse(BitRow row, int start, Span<int> counters)
-    {
-        var numTransitionsLeft = counters.Length;
-        var last = row[start];
-        while (start > 0 && numTransitionsLeft >= 0)
-        {
-            if (row[--start] != last)
-            {
-                numTransitionsLeft--;
-                last = !last;
-            }
-        }
-
-        if (numTransitionsLeft >= 0)
-        {
-            return false;
-        }
-
-        return RecordPattern(row, start + 1, counters);
-    }
-
     /// <summary>
     /// Scores how closely measured run widths match an expected module width pattern.
     /// </summary>

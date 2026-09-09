@@ -1,6 +1,7 @@
 /* Demo site styles. No CSS framework: the library has no dependencies and neither does its demo. */
 
 :root {
+    color-scheme: dark;
     --bg: #0a0c11;
     --bg-elevated: #12151d;
     --bg-inset: #0d1017;
@@ -540,4 +541,46 @@ td.mono {
 @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto; }
     .boot__spinner { animation-duration: 4s; }
+}
+
+/* Wide content scrolls inside its own box rather than making the page scroll sideways on a
+   phone. */
+.table-scroll {
+    inline-size: 100%;
+    max-inline-size: 100%;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+}
+
+/* The custom message template used on the customisation page. */
+.demo-message {
+    display: inline-block;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+}
+
+@media (forced-colors: active) {
+    .sidebar__link.active {
+        border-inline-start: 3px solid Highlight;
+        forced-color-adjust: none;
+    }
+
+    .bar__segment {
+        forced-color-adjust: none;
+        border-inline-end: 1px solid CanvasText;
+    }
+}
+
+/* The badge the live playground draws over the viewfinder through ChildContent. */
+.scan-badge {
+    position: absolute;
+    inset-block-start: 2.5rem;
+    inset-inline-end: 0.75rem;
+    padding: 0.2rem 0.55rem;
+    border-radius: 999px;
+    background: rgba(53, 199, 124, 0.9);
+    color: #06240f;
+    font-size: 0.75rem;
+    font-weight: 700;
+    pointer-events: none;
 }

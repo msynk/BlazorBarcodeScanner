@@ -16,6 +16,7 @@
                         ShowControls="true"
                         OnScan="r => _last = r"
                         OnCameraChanged="OnCameraChanged"
+                        OnStatusChanged="OnStatusChanged"
                         OnError="e => _error = e" />
 
         @if (_error is not null)
@@ -202,6 +203,17 @@
         _camera = camera;
         _error = null;
         await RefreshCameras();
+        StateHasChanged();
+    }
+
+    private void OnStatusChanged(ScannerStatus status)
+    {
+        // The card describes a running track, so it has to empty when the track goes away.
+        if (status is ScannerStatus.Stopped or ScannerStatus.Faulted or ScannerStatus.Idle)
+        {
+            _camera = null;
+        }
+
         StateHasChanged();
     }
 }

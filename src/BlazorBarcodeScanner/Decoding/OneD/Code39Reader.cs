@@ -76,7 +76,17 @@ public sealed class Code39Reader : IRowDecoder
         var result = _builder;
         result.Clear();
 
+        // The asterisk fixes the narrow element width; every later character must agree with it
+        // and the gaps between characters may not exceed a few narrow elements.
+        var narrowReference = NarrowWidth(counters, AsteriskEncoding);
+        var maxGap = (int)(narrowReference * 6) + 1;
+
         var nextStart = row.GetNextSet(patternEnd);
+        if (nextStart - patternEnd > maxGap)
+        {
+            return null;
+        }
+
         var end = row.Size;
         var lastStart = patternStart;
 
@@ -89,6 +99,12 @@ public sealed class Code39Reader : IRowDecoder
 
             var pattern = ToNarrowWidePattern(counters);
             if (pattern < 0)
+            {
+                return null;
+            }
+
+            var narrow = NarrowWidth(counters, pattern);
+            if (narrow * 2 < narrowReference || narrow > narrowReference * 2)
             {
                 return null;
             }
@@ -111,12 +127,18 @@ public sealed class Code39Reader : IRowDecoder
                 nextStart += counter;
             }
 
+            var gapStart = nextStart;
             nextStart = row.GetNextSet(nextStart);
 
             if (isAsterisk)
             {
                 // The closing delimiter marks the end of the symbol.
                 break;
+            }
+
+            if (nextStart - gapStart > maxGap)
+            {
+                return null;
             }
 
             // Guard against a runaway scan on a noisy row.
@@ -130,9 +152,11 @@ public sealed class Code39Reader : IRowDecoder
 
         SymbolDecodeResult? Finish()
         {
+            // Require a quiet zone after the closing asterisk, inside the frame: a symbol that
+            // runs off the edge of the image cannot be trusted.
             var lastPatternSize = MathUtils.Sum(counters);
             var whiteSpaceAfterEnd = nextStart - lastStart - lastPatternSize;
-            if (nextStart != end && (whiteSpaceAfterEnd * 2) < lastPatternSize)
+            if ((whiteSpaceAfterEnd * 2) < lastPatternSize)
             {
                 return null;
             }
@@ -203,9 +227,12 @@ public sealed class Code39Reader : IRowDecoder
 
             if (counterPosition == PatternLength - 1)
             {
-                // Require a quiet zone of at least half the start pattern width before the symbol.
-                if (ToNarrowWidePattern(counters) == AsteriskEncoding &&
-                    row.IsRange(Math.Max(0, start - ((i - start) / 2)), start, false))
+                // Require a quiet zone of at least half the start pattern width before the
+                // symbol, and require it to lie inside the frame.
+                var quietStart = start - ((i - start) / 2);
+                if (quietStart >= 0 &&
+                    ToNarrowWidePattern(counters) == AsteriskEncoding &&
+                    row.IsRange(quietStart, start, false))
                 {
                     patternStart = start;
                     patternEnd = i;
@@ -271,19 +298,27 @@ public sealed class Code39Reader : IRowDecoder
             {
                 // Three wide elements is the right count, but they also have to be similar in
                 // width; a single element that is more than half the total is a mis-measurement.
-                for (var i = 0; i < numCounters && wideCounters > 0; i++)
+                var totalNarrowWidth = 0;
+                for (var i = 0; i < numCounters; i++)
                 {
                     var counter = counters[i];
                     if (counter <= maxNarrowCounter)
                     {
+                        totalNarrowWidth += counter;
                         continue;
                     }
 
-                    wideCounters--;
                     if (counter * 2 >= totalWideCountersWidth)
                     {
                         return -1;
                     }
+                }
+
+                // The specification allows wide to narrow ratios from 2:1 to 3:1. Anything close
+                // to 1:1 is a run of noise whose widths happen to sort into two groups.
+                if (totalWideCountersWidth * 6 < totalNarrowWidth * 3 * 16 / 10)
+                {
+                    return -1;
                 }
 
                 return pattern;
@@ -292,6 +327,23 @@ public sealed class Code39Reader : IRowDecoder
         while (wideCounters > 3);
 
         return -1;
+    }
+
+    /// <summary>Average width of the six narrow elements of a character.</summary>
+    private static float NarrowWidth(int[] counters, int pattern)
+    {
+        var total = 0;
+        var count = 0;
+        for (var i = 0; i < counters.Length; i++)
+        {
+            if ((pattern & (1 << (counters.Length - 1 - i))) == 0)
+            {
+                total += counters[i];
+                count++;
+            }
+        }
+
+        return count == 0 ? 0 : (float)total / count;
     }
 
     private static string? DecodeExtended(StringBuilder encoded)

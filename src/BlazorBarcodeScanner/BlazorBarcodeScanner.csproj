@@ -4,17 +4,35 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CS1591</NoWarn>
-    <PackageId>BlazorBarcodeScanner</PackageId>
-    <Description>A dependency-free, high performance barcode scanner for Blazor. Decoding is implemented entirely in C#.</Description>
-    <PackageTags>blazor;barcode;qrcode;scanner;datamatrix;pdf417;ean;upc;code128</PackageTags>
     <RootNamespace>BlazorBarcodeScanner</RootNamespace>
     <IsTrimmable>true</IsTrimmable>
     <ServerGarbageCollection>false</ServerGarbageCollection>
   </PropertyGroup>
 
+  <PropertyGroup Label="Package">
+    <PackageId>BlazorBarcodeScanner</PackageId>
+    <Version>1.0.0</Version>
+    <Description>A dependency-free, high performance barcode scanner for Blazor. QR Code, Data Matrix, Code 128, Code 39, EAN-13, EAN-8, UPC-A, UPC-E and ITF, with the decoding implemented entirely in C#: no barcode SDK, no JavaScript scanner library, no runtime dependency beyond Microsoft.AspNetCore.Components.Web.</Description>
+    <PackageTags>blazor;barcode;qrcode;scanner;datamatrix;ean;upc;code128;code39;itf;webassembly</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/msynk/BlazorBarcodeScanner</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/msynk/BlazorBarcodeScanner</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+  </PropertyGroup>
+
   <ItemGroup>
     <SupportedPlatform Include="browser" />
     <PackageReference Include="Microsoft.AspNetCore.Components.Web" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" Visible="false" />
+    <None Include="../../LICENSE" Pack="true" PackagePath="/" Visible="false" />
   </ItemGroup>
 
 </Project>

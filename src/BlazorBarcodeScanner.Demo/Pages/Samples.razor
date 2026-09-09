@@ -34,10 +34,12 @@
 <div class="grid grid--2">
     @foreach (var sample in SampleCatalog.All.Where(s => (s.Format & BarcodeFormat.AllLinear) != 0))
     {
+        @* Two CSS pixels per module, so the bars survive rasterisation on a 1x display and a
+           phone camera can read them off the screen. *@
         <BarcodeSvg Modules="sample.Modules"
                     Caption="@sample.Caption"
                     Value="@sample.Value"
-                    Size="300"
+                    Size="@Math.Clamp((sample.Modules!.Length + 24) * 2, 300, 720)"
                     LinearHeight="26"
                     QuietZone="12" />
     }

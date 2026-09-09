@@ -24,11 +24,16 @@ public sealed class QrFinderPatternFinder
     private const int MinSkip = 3;
     private const int MaxModules = 97;
 
-    private readonly BitMatrix _image;
     private readonly List<QrFinderPattern> _possibleCenters = new(8);
     private readonly int[] _crossCheckStateCount = new int[5];
 
+    private BitMatrix? _image;
     private bool _hasSkipped;
+
+    /// <summary>Creates a finder without an image; call <see cref="Reset"/> before searching.</summary>
+    public QrFinderPatternFinder()
+    {
+    }
 
     /// <summary>Creates a finder over a binarised image.</summary>
     /// <param name="image">The binarised image.</param>
@@ -36,6 +41,19 @@ public sealed class QrFinderPatternFinder
     {
         ArgumentNullException.ThrowIfNull(image);
         _image = image;
+    }
+
+    /// <summary>
+    /// Points the finder at another image and forgets the previous search, so that continuous
+    /// scanning reuses one instance and its candidate list.
+    /// </summary>
+    /// <param name="image">The binarised image.</param>
+    public void Reset(BitMatrix image)
+    {
+        ArgumentNullException.ThrowIfNull(image);
+        _image = image;
+        _possibleCenters.Clear();
+        _hasSkipped = false;
     }
 
     /// <summary>
@@ -52,8 +70,8 @@ public sealed class QrFinderPatternFinder
         _possibleCenters.Clear();
         _hasSkipped = false;
 
-        var maxI = _image.Height;
-        var maxJ = _image.Width;
+        var maxI = _image!.Height;
+        var maxJ = _image!.Width;
 
         var iSkip = (3 * maxI) / (4 * MaxModules);
         if (iSkip < MinSkip || tryHarder)
@@ -71,7 +89,7 @@ public sealed class QrFinderPatternFinder
 
             for (var j = 0; j < maxJ; j++)
             {
-                if (_image[j, i])
+                if (_image![j, i])
                 {
                     // Black.
                     if ((currentState & 1) == 1)
@@ -224,12 +242,12 @@ public sealed class QrFinderPatternFinder
 
     private float CrossCheckVertical(int startI, int centerJ, int maxCount, int originalStateCountTotal)
     {
-        var maxI = _image.Height;
+        var maxI = _image!.Height;
         var stateCount = _crossCheckStateCount;
         Array.Clear(stateCount);
 
         var i = startI;
-        while (i >= 0 && _image[centerJ, i])
+        while (i >= 0 && _image![centerJ, i])
         {
             stateCount[2]++;
             i--;
@@ -240,7 +258,7 @@ public sealed class QrFinderPatternFinder
             return float.NaN;
         }
 
-        while (i >= 0 && !_image[centerJ, i] && stateCount[1] <= maxCount)
+        while (i >= 0 && !_image![centerJ, i] && stateCount[1] <= maxCount)
         {
             stateCount[1]++;
             i--;
@@ -251,7 +269,7 @@ public sealed class QrFinderPatternFinder
             return float.NaN;
         }
 
-        while (i >= 0 && _image[centerJ, i] && stateCount[0] <= maxCount)
+        while (i >= 0 && _image![centerJ, i] && stateCount[0] <= maxCount)
         {
             stateCount[0]++;
             i--;
@@ -263,7 +281,7 @@ public sealed class QrFinderPatternFinder
         }
 
         i = startI + 1;
-        while (i < maxI && _image[centerJ, i])
+        while (i < maxI && _image![centerJ, i])
         {
             stateCount[2]++;
             i++;
@@ -274,7 +292,7 @@ public sealed class QrFinderPatternFinder
             return float.NaN;
         }
 
-        while (i < maxI && !_image[centerJ, i] && stateCount[3] < maxCount)
+        while (i < maxI && !_image![centerJ, i] && stateCount[3] < maxCount)
         {
             stateCount[3]++;
             i++;
@@ -285,7 +303,7 @@ public sealed class QrFinderPatternFinder
             return float.NaN;
         }
 
-        while (i < maxI && _image[centerJ, i] && stateCount[4] < maxCount)
+        while (i < maxI && _image![centerJ, i] && stateCount[4] < maxCount)
         {
             stateCount[4]++;
             i++;
@@ -307,12 +325,12 @@ public sealed class QrFinderPatternFinder
 
     private float CrossCheckHorizontal(int startJ, int centerI, int maxCount, int originalStateCountTotal)
     {
-        var maxJ = _image.Width;
+        var maxJ = _image!.Width;
         var stateCount = _crossCheckStateCount;
         Array.Clear(stateCount);
 
         var j = startJ;
-        while (j >= 0 && _image[j, centerI])
+        while (j >= 0 && _image![j, centerI])
         {
             stateCount[2]++;
             j--;
@@ -323,7 +341,7 @@ public sealed class QrFinderPatternFinder
             return float.NaN;
         }
 
-        while (j >= 0 && !_image[j, centerI] && stateCount[1] <= maxCount)
+        while (j >= 0 && !_image![j, centerI] && stateCount[1] <= maxCount)
         {
             stateCount[1]++;
             j--;
@@ -334,7 +352,7 @@ public sealed class QrFinderPatternFinder
             return float.NaN;
         }
 
-        while (j >= 0 && _image[j, centerI] && stateCount[0] <= maxCount)
+        while (j >= 0 && _image![j, centerI] && stateCount[0] <= maxCount)
         {
             stateCount[0]++;
             j--;
@@ -346,7 +364,7 @@ public sealed class QrFinderPatternFinder
         }
 
         j = startJ + 1;
-        while (j < maxJ && _image[j, centerI])
+        while (j < maxJ && _image![j, centerI])
         {
             stateCount[2]++;
             j++;
@@ -357,7 +375,7 @@ public sealed class QrFinderPatternFinder
             return float.NaN;
         }
 
-        while (j < maxJ && !_image[j, centerI] && stateCount[3] < maxCount)
+        while (j < maxJ && !_image![j, centerI] && stateCount[3] < maxCount)
         {
             stateCount[3]++;
             j++;
@@ -368,7 +386,7 @@ public sealed class QrFinderPatternFinder
             return float.NaN;
         }
 
-        while (j < maxJ && _image[j, centerI] && stateCount[4] < maxCount)
+        while (j < maxJ && _image![j, centerI] && stateCount[4] < maxCount)
         {
             stateCount[4]++;
             j++;
@@ -397,7 +415,7 @@ public sealed class QrFinderPatternFinder
         Span<int> stateCount = stackalloc int[5];
 
         var i = 0;
-        while (centerI >= i && centerJ >= i && _image[centerJ - i, centerI - i])
+        while (centerI >= i && centerJ >= i && _image![centerJ - i, centerI - i])
         {
             stateCount[2]++;
             i++;
@@ -408,7 +426,7 @@ public sealed class QrFinderPatternFinder
             return false;
         }
 
-        while (centerI >= i && centerJ >= i && !_image[centerJ - i, centerI - i] && stateCount[1] <= centerI)
+        while (centerI >= i && centerJ >= i && !_image![centerJ - i, centerI - i] && stateCount[1] <= centerI)
         {
             stateCount[1]++;
             i++;
@@ -419,17 +437,17 @@ public sealed class QrFinderPatternFinder
             return false;
         }
 
-        while (centerI >= i && centerJ >= i && _image[centerJ - i, centerI - i])
+        while (centerI >= i && centerJ >= i && _image![centerJ - i, centerI - i])
         {
             stateCount[0]++;
             i++;
         }
 
-        var maxI = _image.Height;
-        var maxJ = _image.Width;
+        var maxI = _image!.Height;
+        var maxJ = _image!.Width;
 
         i = 1;
-        while (centerI + i < maxI && centerJ + i < maxJ && _image[centerJ + i, centerI + i])
+        while (centerI + i < maxI && centerJ + i < maxJ && _image![centerJ + i, centerI + i])
         {
             stateCount[2]++;
             i++;
@@ -440,7 +458,7 @@ public sealed class QrFinderPatternFinder
             return false;
         }
 
-        while (centerI + i < maxI && centerJ + i < maxJ && !_image[centerJ + i, centerI + i])
+        while (centerI + i < maxI && centerJ + i < maxJ && !_image![centerJ + i, centerI + i])
         {
             stateCount[3]++;
             i++;
@@ -451,7 +469,7 @@ public sealed class QrFinderPatternFinder
             return false;
         }
 
-        while (centerI + i < maxI && centerJ + i < maxJ && _image[centerJ + i, centerI + i])
+        while (centerI + i < maxI && centerJ + i < maxJ && _image![centerJ + i, centerI + i])
         {
             stateCount[4]++;
             i++;

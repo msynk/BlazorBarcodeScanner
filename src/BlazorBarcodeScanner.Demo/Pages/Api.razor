@@ -30,13 +30,14 @@
         <tr><td class="mono">ShowMask</td><td class="mono">bool</td><td class="mono">true</td><td>Dim outside the scan region.</td></tr>
         <tr><td class="mono">HighlightResults</td><td class="mono">bool</td><td class="mono">true</td><td>Outline a decoded symbol in place.</td></tr>
         <tr><td class="mono">EnableFileScanning</td><td class="mono">bool</td><td class="mono">true</td><td>Offer still image scanning.</td></tr>
-        <tr><td class="mono">Fill</td><td class="mono">bool</td><td class="mono">false</td><td>Fill the parent height instead of a 4:3 box.</td></tr>
+        <tr><td class="mono">Fill</td><td class="mono">bool</td><td class="mono">false</td><td>Fill the parent instead of keeping the camera's aspect ratio.</td></tr>
         <tr><td class="mono">AriaLabel</td><td class="mono">string</td><td class="mono">"Barcode scanner"</td><td>Accessible name for the region.</td></tr>
         <tr><td class="mono">CssClass</td><td class="mono">string?</td><td class="mono">null</td><td>Extra classes on the root element.</td></tr>
         <tr><td class="mono">Overlay</td><td class="mono">RenderFragment&lt;BarcodeScanner&gt;?</td><td class="mono">null</td><td>Replaces the reticle; receives the scanner.</td></tr>
         <tr><td class="mono">MessageTemplate</td><td class="mono">RenderFragment&lt;string&gt;?</td><td class="mono">null</td><td>Replaces status and error message rendering.</td></tr>
         <tr><td class="mono">ControlsContent</td><td class="mono">RenderFragment?</td><td class="mono">null</td><td>Extra controls in the built-in bar.</td></tr>
         <tr><td class="mono">ChildContent</td><td class="mono">RenderFragment?</td><td class="mono">null</td><td>Arbitrary content over the viewport.</td></tr>
+        <tr><td class="mono">@@attributes</td><td class="mono">any</td><td class="mono">-</td><td>Any other attribute is applied to the root element. A <code>class</code> or <code>style</code> given this way is merged with the component's own rather than replacing it.</td></tr>
     </tbody>
 </table>
 
@@ -68,8 +69,18 @@ ScannerStatus   Status
 CameraInfo?     Camera
 IReadOnlyList&lt;CameraDevice&gt; Cameras
 ScanDiagnostics Diagnostics
+long            FramesDecoded
+long            FramesWithSymbol
 bool            IsTorchOn
-double          Zoom</code></pre>
+double          Zoom
+(int, int)      ProcessingSize</code></pre>
+
+<p class="field__hint">
+    <code>StartAsync</code> is safe to call at any time: a call that arrives while an earlier one
+    is still waiting for the permission prompt supersedes it, and the superseded request releases
+    its camera rather than leaving it running. The same holds for <code>StopAsync</code> and for
+    disposal, so navigating away mid-prompt never leaves the camera indicator lit.
+</p>
 
 <h2>BarcodeResult</h2>
 <table>
@@ -89,14 +100,26 @@ double          Zoom</code></pre>
 <h2>ScannerOptions</h2>
 <pre><code>BarcodeFormat Formats                    = BarcodeFormat.All
 ScanRegion    Region                     = ScanRegion.Full
-int           MaxScanLines               = 15
+int           MaxScanLines               = 15      // lines per orientation
 int           DownsampleFactor           = 1
-bool          TryHarder                  = false
-bool          AllowInverted              = false
-bool          TryReversedRows            = true
+bool          TryHarder                  = false   // exhaustive detection, full rotation sweep
+bool          AllowInverted              = false   // light on dark symbols
+bool          TryReversedRows            = true    // linear symbols read right to left
+bool          TryVerticalLines           = true    // columns and tilted lines, for rotated symbols
+IReadOnlyCollection&lt;int&gt; ItfLengths      = 6..20 even
+bool          Code39CheckDigit           = false   // require the modulo 43 check character
+bool          Code39ExtendedMode         = false   // interpret Code 39 as full ASCII
 TimeSpan      DuplicateSuppressionWindow = 2 seconds
 
-ScannerOptions.ForStillImages()   // 60 scan lines, TryHarder, AllowInverted, no suppression</code></pre>
+ScannerOptions.ForStillImages()   // 60 scan lines, TryHarder, AllowInverted, no suppression
+options.Clone()                   // take a copy before editing a running scanner's options
+options.Validate()                // throws on an out of range value</code></pre>
+
+<p class="field__hint">
+    ITF has no check character, so <code>ItfLengths</code> is the main defence against a
+    truncated symbol being reported as a shorter, structurally valid number. Narrow it to the
+    lengths your application actually uses.
+</p>
 
 <h2>Headless use</h2>
 <p>

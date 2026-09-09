@@ -47,8 +47,19 @@ public static class GridSampler
                 // producing a matrix with fabricated modules.
                 for (var x = 0; x < dimensionX; x++)
                 {
-                    var px = (int)points[x * 2];
-                    var py = (int)points[(x * 2) + 1];
+                    var fx = points[x * 2];
+                    var fy = points[(x * 2) + 1];
+
+                    // A degenerate transform produces NaN, which truncates to zero and would
+                    // otherwise sample the top-left pixel for every module.
+                    if (!float.IsFinite(fx) || !float.IsFinite(fy))
+                    {
+                        succeeded = false;
+                        break;
+                    }
+
+                    var px = (int)fx;
+                    var py = (int)fy;
                     if ((uint)px >= (uint)image.Width || (uint)py >= (uint)image.Height)
                     {
                         succeeded = false;

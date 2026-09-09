@@ -55,14 +55,16 @@ public sealed class WhiteRectangleDetector
     {
         ArgumentNullException.ThrowIfNull(image);
 
-        var detector = new WhiteRectangleDetector(image, initSize, x, y);
-        if (detector._upInit < 0 || detector._leftInit < 0 ||
-            detector._downInit >= image.Height || detector._rightInit >= image.Width)
+        // Checked before allocating: this is called on every frame that finds no symbol, and on
+        // a small image it fails every time.
+        var halfSize = initSize / 2;
+        if (x - halfSize < 0 || y - halfSize < 0 ||
+            y + halfSize >= image.Height || x + halfSize >= image.Width)
         {
             return null;
         }
 
-        return detector;
+        return new WhiteRectangleDetector(image, initSize, x, y);
     }
 
     /// <summary>

@@ -58,6 +58,30 @@ public sealed class ScannerOptions
     public bool TryReversedRows { get; set; } = true;
 
     /// <summary>
+    /// Also scan columns, so that a linear symbol presented vertically is read. Costs about as
+    /// much as the row pass on frames that contain no symbol.
+    /// </summary>
+    public bool TryVerticalLines { get; set; } = true;
+
+    /// <summary>
+    /// Digit counts an ITF result may have. ITF has no check character, so a partial scan can
+    /// yield a shorter but internally valid number; restricting the accepted lengths to the ones
+    /// an application actually uses is the standard defence. An empty collection accepts any
+    /// even length.
+    /// </summary>
+    public IReadOnlyCollection<int> ItfLengths { get; set; } = [6, 8, 10, 12, 14, 16, 18, 20];
+
+    /// <summary>
+    /// Require and strip the optional modulo 43 check character of Code 39 symbols.
+    /// </summary>
+    public bool Code39CheckDigit { get; set; }
+
+    /// <summary>
+    /// Interpret Code 39 symbols as full ASCII, where pairs such as <c>+A</c> stand for <c>a</c>.
+    /// </summary>
+    public bool Code39ExtendedMode { get; set; }
+
+    /// <summary>
     /// How long the same value from the same symbology is suppressed after being reported.
     /// Set to <see cref="TimeSpan.Zero"/> to report every successful frame.
     /// </summary>
@@ -73,6 +97,10 @@ public sealed class ScannerOptions
         TryHarder = TryHarder,
         AllowInverted = AllowInverted,
         TryReversedRows = TryReversedRows,
+        TryVerticalLines = TryVerticalLines,
+        ItfLengths = ItfLengths,
+        Code39CheckDigit = Code39CheckDigit,
+        Code39ExtendedMode = Code39ExtendedMode,
         DuplicateSuppressionWindow = DuplicateSuppressionWindow,
     };
 
@@ -92,5 +120,13 @@ public sealed class ScannerOptions
         ArgumentOutOfRangeException.ThrowIfLessThan(DownsampleFactor, 1, nameof(DownsampleFactor));
         ArgumentOutOfRangeException.ThrowIfGreaterThan(DownsampleFactor, 8, nameof(DownsampleFactor));
         ArgumentOutOfRangeException.ThrowIfNegative(DuplicateSuppressionWindow.Ticks, nameof(DuplicateSuppressionWindow));
+        ArgumentNullException.ThrowIfNull(ItfLengths, nameof(ItfLengths));
+        foreach (var length in ItfLengths)
+        {
+            if (length <= 0 || (length & 1) != 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(ItfLengths), "ITF lengths must be positive even numbers.");
+            }
+        }
     }
 }

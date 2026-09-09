@@ -149,6 +149,14 @@ public sealed class GlobalHistogramBinarizer : IBinarizer
             }
         }
 
+        // No second peak at all means every sample landed in one bucket: a blank, flat line with
+        // no ink on it. Reporting a black point anyway would send every row decoder over an
+        // empty row, which is the commonest frame a scanner sees.
+        if (secondPeakScore == 0)
+        {
+            return false;
+        }
+
         if (firstPeak > secondPeak)
         {
             (firstPeak, secondPeak) = (secondPeak, firstPeak);
