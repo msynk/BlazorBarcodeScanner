@@ -30,6 +30,13 @@ public sealed class DataMatrixDetector
     private const int MinModules = 8;
     private const int MaxModules = 144;
 
+    /// <summary>
+    /// The depth of the first scan along every edge, in pixels. Shallow enough to stay inside
+    /// the outermost row of modules at two pixels per module, so that no scan ever has to guess
+    /// the module size before one has been measured.
+    /// </summary>
+    private const float ShallowInset = 1.5f;
+
     private BitMatrix _image;
     private readonly DarkRegionFinder _regionFinder;
     private readonly List<ScanPoint> _samples;
@@ -117,33 +124,14 @@ public sealed class DataMatrixDetector
             used |= 1L << best;
             examined++;
 
-            var result = DetectInRegion(regions[best]);
-            if (result is null)
-            {
-                continue;
-            }
-
-            if (accept(result))
+            var result = DetectInRegion(regions[best], accept);
+            if (result is not null)
             {
                 return result;
             }
-
-            result.Dispose();
         }
 
-        var fallback = DetectFromCenter();
-        if (fallback is null)
-        {
-            return null;
-        }
-
-        if (accept(fallback))
-        {
-            return fallback;
-        }
-
-        fallback.Dispose();
-        return null;
+        return DetectFromCenter(accept);
     }
 
     private static bool IsPlausibleRegion(in DarkRegion region)
@@ -155,14 +143,15 @@ public sealed class DataMatrixDetector
             return false;
         }
 
-        // The most elongated Data Matrix shape is 16 by 48; anything thinner is a line of text
-        // or a linear symbol.
+        // The most elongated Data Matrix shapes are 8 by 32 and 16 by 48; anything much thinner
+        // is a line of text or a linear symbol. The region is measured in whole cells, which can
+        // round a 4:1 symbol past 4:1, hence the slack.
         var longer = Math.Max(width, height);
         var shorter = Math.Min(width, height);
-        return longer <= shorter * 4;
+        return longer <= shorter * 5;
     }
 
-    private DetectorResult? DetectInRegion(in DarkRegion region)
+    private DetectorResult? DetectInRegion(in DarkRegion region, Func<DetectorResult, bool> accept)
     {
         var left = Math.Max(0, region.Left - 1);
         var top = Math.Max(0, region.Top - 1);
@@ -187,20 +176,24 @@ public sealed class DataMatrixDetector
             return null;
         }
 
-        return SampleQuadrilateral(corners);
+        return SampleQuadrilateral(corners, accept);
     }
 
     /// <summary>
-    /// Orients, refines and samples a rough quadrilateral around a symbol.
+    /// Orients, refines and samples a rough quadrilateral around a symbol, offering each
+    /// plausible module count to <paramref name="accept"/> in turn.
     /// </summary>
-    private DetectorResult? SampleQuadrilateral(Span<ScanPoint> corners)
+    private DetectorResult? SampleQuadrilateral(Span<ScanPoint> corners, Func<DetectorResult, bool> accept)
     {
         // Corners are ordered clockwise on screen: TL, TR, BR, BL for an upright symbol.
         var centroidX = (corners[0].X + corners[1].X + corners[2].X + corners[3].X) / 4;
         var centroidY = (corners[0].Y + corners[1].Y + corners[2].Y + corners[3].Y) / 4;
 
+        // A first, shallow scan of every edge: the busiest edge is a dashed one and its
+        // transition count gives a first estimate of the module pitch.
         Span<int> transitions = stackalloc int[4];
         Span<float> lengths = stackalloc float[4];
+        var pitch = float.MaxValue;
         for (var i = 0; i < 4; i++)
         {
             var a = corners[i];
@@ -211,8 +204,21 @@ public sealed class DataMatrixDetector
                 return null;
             }
 
-            var inset = Math.Clamp(lengths[i] / 40, 1.5f, 4f);
-            transitions[i] = TransitionsAlongEdge(a, b, centroidX, centroidY, inset);
+            transitions[i] = TransitionsAlongEdge(a, b, centroidX, centroidY, ShallowInset);
+            pitch = Math.Min(pitch, lengths[i] / (transitions[i] + 1));
+        }
+
+        // Scan again half a module in, where the timing pattern is read most reliably, but never
+        // deeper than four pixels: the corners are still rough and a deep scan along an
+        // inaccurate edge would wander into the data region. Half the pitch keeps the scan out
+        // of the data region whatever the module size.
+        var inset = Math.Clamp(pitch / 2, ShallowInset, 4f);
+        if (inset > ShallowInset)
+        {
+            for (var i = 0; i < 4; i++)
+            {
+                transitions[i] = TransitionsAlongEdge(corners[i], corners[(i + 1) & 3], centroidX, centroidY, inset);
+            }
         }
 
         // The L is the pair of adjacent edges with the fewest transitions.
@@ -274,6 +280,16 @@ public sealed class DataMatrixDetector
             return null;
         }
 
+        // Both edges were measured on the same symbol, so their module pitches must agree. A
+        // pitch twice the other means one scan ran through the data region and counted half the
+        // modules, whereas even a 45 degree tilt foreshortens one axis by under 30 percent.
+        var pitchAcross = ScanPoint.Distance(topLeft, topRight) / columns;
+        var pitchDown = ScanPoint.Distance(topRight, bottomRight) / rows;
+        if (Math.Max(pitchAcross, pitchDown) > 1.4f * Math.Min(pitchAcross, pitchDown))
+        {
+            return null;
+        }
+
         // Aspect ratios between 2:3 and 3:2 can only come from a square symbol measured
         // imprecisely, because no rectangular shape is that close to square.
         if (4 * columns < 6 * rows && 4 * rows < 6 * columns)
@@ -281,33 +297,65 @@ public sealed class DataMatrixDetector
             columns = rows = Math.Max(columns, rows);
         }
 
-        if (DataMatrixVersion.GetVersionForDimensions(rows, columns) is null &&
-            !TryNearestLegalSize(ref rows, ref columns))
+        Span<(int Rows, int Columns)> sizes = stackalloc (int, int)[MaxSizeCandidates];
+        var sizeCount = LegalSizesNear(rows, columns, pitchDown, pitchAcross, sizes);
+        for (var i = 0; i < sizeCount; i++)
         {
-            return null;
+            (rows, columns) = sizes[i];
+            var transform = PerspectiveTransform.QuadrilateralToQuadrilateral(
+                0, 0,
+                columns, 0,
+                columns, rows,
+                0, rows,
+                topLeft.X, topLeft.Y,
+                topRight.X, topRight.Y,
+                bottomRight.X, bottomRight.Y,
+                bottomLeft.X, bottomLeft.Y);
+
+            var bits = GridSampler.Sample(_image, columns, rows, transform);
+            if (bits is null)
+            {
+                continue;
+            }
+
+            var result = new DetectorResult(bits, [topLeft, bottomLeft, bottomRight, topRight]);
+            if (accept(result))
+            {
+                return result;
+            }
+
+            result.Dispose();
         }
 
-        var transform = PerspectiveTransform.QuadrilateralToQuadrilateral(
-            0, 0,
-            columns, 0,
-            columns, rows,
-            0, rows,
-            topLeft.X, topLeft.Y,
-            topRight.X, topRight.Y,
-            bottomRight.X, bottomRight.Y,
-            bottomLeft.X, bottomLeft.Y);
-
-        var bits = GridSampler.Sample(_image, columns, rows, transform);
-        return bits is null
-            ? null
-            : new DetectorResult(bits, [topLeft, bottomLeft, bottomRight, topRight]);
+        return null;
     }
 
-    private static bool TryNearestLegalSize(ref int rows, ref int columns)
+    /// <summary>The eight sizes two modules away from a measurement in either dimension.</summary>
+    private const int MaxSizeCandidates = 8;
+
+    /// <summary>
+    /// Lists the legal symbol sizes the measured one could be, nearest first; a measured size
+    /// that is itself legal is the only candidate.
+    /// </summary>
+    /// <remarks>
+    /// Timing patterns are counted to within a module or two, which can leave the measurement
+    /// between two legal sizes: 14 by 36 is as close to 12 by 36 as to 16 by 36. Equally near
+    /// sizes are ordered by how well their module pitch agrees between the two measured edges,
+    /// and every one of them is offered for decoding.
+    /// </remarks>
+    private static int LegalSizesNear(int rows, int columns, float lengthDownPerRow, float lengthAcrossPerColumn, Span<(int Rows, int Columns)> sizes)
     {
-        var bestRows = 0;
-        var bestColumns = 0;
-        var bestCost = int.MaxValue;
+        if (DataMatrixVersion.GetVersionForDimensions(rows, columns) is not null)
+        {
+            sizes[0] = (rows, columns);
+            return 1;
+        }
+
+        var lengthDown = lengthDownPerRow * rows;
+        var lengthAcross = lengthAcrossPerColumn * columns;
+
+        Span<float> costs = stackalloc float[MaxSizeCandidates];
+        var count = 0;
         for (var dr = -2; dr <= 2; dr += 2)
         {
             for (var dc = -2; dc <= 2; dc += 2)
@@ -319,37 +367,54 @@ public sealed class DataMatrixDetector
                     continue;
                 }
 
-                var cost = Math.Abs(dr) + Math.Abs(dc);
-                if (cost < bestCost)
+                // Whole modules of error first, pitch disagreement (always under one) as the
+                // tie breaker. Insertion sort keeps the list ordered as it grows.
+                var pitchDown = lengthDown / r;
+                var pitchAcross = lengthAcross / c;
+                var cost = Math.Abs(dr) + Math.Abs(dc) + (Math.Abs(pitchDown - pitchAcross) / Math.Max(pitchDown, pitchAcross));
+
+                var at = count++;
+                while (at > 0 && costs[at - 1] > cost)
                 {
-                    bestCost = cost;
-                    bestRows = r;
-                    bestColumns = c;
+                    costs[at] = costs[at - 1];
+                    sizes[at] = sizes[at - 1];
+                    at--;
                 }
+
+                costs[at] = cost;
+                sizes[at] = (r, c);
             }
         }
 
-        if (bestCost == int.MaxValue)
+        // Only the nearest sizes are worth sampling; a whole module further out is a different
+        // symbol.
+        var limit = 0;
+        while (limit < count && costs[limit] - costs[0] < 1)
         {
-            return false;
+            limit++;
         }
 
-        rows = bestRows;
-        columns = bestColumns;
-        return true;
+        return limit;
     }
 
     /// <summary>
     /// Counts the modules along a dashed edge: one more than the number of transitions seen half
     /// a module inside the symbol. The module size is unknown at first, so a shallow pass
-    /// estimates it and a second pass at the right depth measures it.
+    /// estimates it and further passes at the depths that estimate implies measure it.
     /// </summary>
+    /// <remarks>
+    /// The timing pattern alternates every module, so no row of the symbol has more transitions
+    /// than it: the largest count any pass sees is the right one. That is what makes the passes
+    /// safe to chain. A pass that rides the edge or strays into the data region undercounts,
+    /// which overestimates the pitch and would send a single follow-up pass deeper still; taking
+    /// the maximum instead means every pass can only shrink the pitch estimate, and an
+    /// intermediate depth is tried so that a first estimate twice too large is still caught.
+    /// </remarks>
     private int MeasureModules(ScanPoint from, ScanPoint to, float centroidX, float centroidY)
     {
         var length = ScanPoint.Distance(from, to);
-        var shallow = Math.Clamp(length / 40, 1.5f, 4f);
-        var estimate = TransitionsAlongEdge(from, to, centroidX, centroidY, shallow) + 1;
-        if (estimate < 2)
+        var transitions = TransitionsAlongEdge(from, to, centroidX, centroidY, ShallowInset);
+        if (transitions < 1)
         {
             return 0;
         }
@@ -357,11 +422,24 @@ public sealed class DataMatrixDetector
         // Half a module in is the middle of the timing pattern's own row of modules: shallower
         // and the scan rides the symbol's edge, deeper and it enters the data region and counts
         // transitions that mean nothing.
-        var module = length / estimate;
-        var inset = Math.Max(1.5f, module / 2);
-        var count = TransitionsAlongEdge(from, to, centroidX, centroidY, inset) + 1;
+        // A quarter of the estimated pitch first, in case the estimate is twice too large, then
+        // half of it, and half again once the count has settled.
+        var deepest = ShallowInset;
+        for (var pass = 0; pass < 3; pass++)
+        {
+            var pitch = length / (transitions + 1);
+            var inset = pass == 0 ? pitch / 4 : pitch / 2;
+            if (inset < deepest + 0.5f)
+            {
+                continue;
+            }
+
+            deepest = inset;
+            transitions = Math.Max(transitions, TransitionsAlongEdge(from, to, centroidX, centroidY, inset));
+        }
 
         // Every Data Matrix dimension is even.
+        var count = transitions + 1;
         return (count + 1) & ~1;
     }
 
@@ -400,8 +478,8 @@ public sealed class DataMatrixDetector
     /// </summary>
     /// <remarks>
     /// Along a dashed edge half of the boundary samples land on white modules and therefore one
-    /// module further in. Only the outer half is kept, which is exactly the half that lies on the
-    /// true edge.
+    /// module further in. Only the outer cluster is kept, which is exactly the set that lies on
+    /// the true edge.
     /// </remarks>
     private bool FitEdge(ScanPoint a, ScanPoint b, float centroidX, float centroidY, bool dashed, out Line line)
     {
@@ -461,8 +539,8 @@ public sealed class DataMatrixDetector
 
         if (dashed)
         {
-            // Keep the outer half of the samples, measured against the first fit.
-            KeepOuterHalf(samples, line, nx, ny);
+            // Keep the outer cluster of the samples, measured against the first fit.
+            KeepOuterCluster(samples, line, nx, ny);
             if (samples.Count < 4 || !Line.TryFit(samples, out line))
             {
                 return false;
@@ -497,7 +575,16 @@ public sealed class DataMatrixDetector
         return true;
     }
 
-    private static void KeepOuterHalf(List<ScanPoint> samples, Line line, float nx, float ny)
+    /// <summary>
+    /// Drops the samples that fell one module deep on the light modules of a dashed edge.
+    /// </summary>
+    /// <remarks>
+    /// The samples form two clusters a module apart, each holding about half of them, so the
+    /// median is a coin toss between the clusters: landing in the deep one keeps the wrong half
+    /// and drags the fitted edge a module inwards. The upper quartile lies in the outer cluster
+    /// whichever way the halves fall, and everything within a pixel of it is kept.
+    /// </remarks>
+    private static void KeepOuterCluster(List<ScanPoint> samples, Line line, float nx, float ny)
     {
         // Signed distance along the outward normal, positive is further out.
         Span<float> distances = stackalloc float[samples.Count];
@@ -509,11 +596,11 @@ public sealed class DataMatrixDetector
         Span<float> sorted = stackalloc float[samples.Count];
         distances.CopyTo(sorted);
         sorted.Sort();
-        var median = sorted[sorted.Length / 2];
+        var upperQuartile = sorted[sorted.Length * 3 / 4];
 
         for (var i = samples.Count - 1; i >= 0; i--)
         {
-            if (distances[i] < median - 0.75f)
+            if (distances[i] < upperQuartile - 0.75f)
             {
                 samples.RemoveAt(i);
             }
@@ -870,7 +957,7 @@ public sealed class DataMatrixDetector
     /// Fallback: grow a rectangle out of the image centre until it is clear of ink, then read the
     /// enclosed shape's corners off its diagonals.
     /// </summary>
-    private DetectorResult? DetectFromCenter()
+    private DetectorResult? DetectFromCenter(Func<DetectorResult, bool> accept)
     {
         var rectangleDetector = WhiteRectangleDetector.Create(_image);
         var cornerPoints = rectangleDetector?.Detect();
@@ -900,7 +987,7 @@ public sealed class DataMatrixDetector
             (corners[1], corners[3]) = (corners[3], corners[1]);
         }
 
-        return SampleQuadrilateral(corners);
+        return SampleQuadrilateral(corners, accept);
     }
 }
 

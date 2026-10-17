@@ -64,7 +64,10 @@ public sealed class ReedSolomonDecoder
             return false;
         }
 
-        if (!TryFindErrorLocations(sigma, out var errorLocations))
+        // A locator of degree zero names no positions. The syndromes are known to be non-zero
+        // here, so that is not a clean block: it is one whose damage the algorithm could not
+        // place, which must be reported rather than passed on uncorrected.
+        if (sigma.Degree == 0 || !TryFindErrorLocations(sigma, out var errorLocations))
         {
             return false;
         }
@@ -79,6 +82,18 @@ public sealed class ReedSolomonDecoder
             }
 
             received[position] = GenericGF.AddOrSubtract(received[position], errorMagnitudes[i]);
+        }
+
+        // Beyond its capacity the algorithm can produce a well formed but wrong correction.
+        // Re-evaluating the syndromes is cheap next to what came before, and it turns such a
+        // miscorrection into a rejection, which is the only safe outcome for a barcode.
+        poly = new GfPoly(_field, received);
+        for (var i = 0; i < twoS; i++)
+        {
+            if (poly.EvaluateAt(_field.Exp(i + _field.GeneratorBase)) != 0)
+            {
+                return false;
+            }
         }
 
         errorsCorrected = errorLocations.Length;

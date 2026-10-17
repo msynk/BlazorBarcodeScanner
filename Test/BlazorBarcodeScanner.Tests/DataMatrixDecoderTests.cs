@@ -9,6 +9,59 @@ namespace BlazorBarcodeScanner.Tests;
 /// <summary>Round trips generated Data Matrix symbols through the decoding path.</summary>
 public class DataMatrixDecoderTests
 {
+    /// <summary>Every one of the thirty shapes at every module size from two to five pixels.</summary>
+    public static TheoryData<int, int> EveryShapeAndScale
+    {
+        get
+        {
+            var data = new TheoryData<int, int>();
+            foreach (var version in DataMatrixVersion.All)
+            {
+                for (var scale = 2; scale <= 5; scale++)
+                {
+                    data.Add(version.VersionNumber, scale);
+                }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>
+    /// Detection measures the symbol from its timing patterns, so every shape at every small
+    /// module size has to come through the whole rendered path, not just the parser.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(EveryShapeAndScale))]
+    public void DecodesEveryShapeFromRenderedImage(int versionNumber, int scale)
+    {
+        var version = DataMatrixVersion.All.Single(v => v.VersionNumber == versionNumber);
+
+        // Fill about half of the symbol with distinct letters so the data region is busy.
+        var content = new string(
+            Enumerable.Range(0, Math.Max(1, version.TotalDataCodewords / 2))
+                .Select(i => (char)('A' + (i * 7 % 26)))
+                .ToArray());
+
+        using var matrix = DataMatrixEncoder.Encode(content, version);
+        Assert.Equal(version.SymbolSizeRows, matrix.Height);
+        Assert.Equal(version.SymbolSizeColumns, matrix.Width);
+
+        using var image = SyntheticImage.FromMatrix(matrix, scale, quietZoneModules: 4);
+        using var binary = new HybridBinarizer().GetBlackMatrix(image.View);
+        Assert.NotNull(binary);
+
+        var reader = new DataMatrixReader();
+        foreach (var options in new[] { MatrixDecodeOptions.Live, MatrixDecodeOptions.Thorough })
+        {
+            var result = reader.Decode(binary, options);
+
+            Assert.True(result is not null, $"{version} at {scale} px/module did not decode (TryHarder: {options.TryHarder}).");
+            Assert.Equal(content, result.Payload.Text);
+            Assert.Equal(version.ToString(), result.Payload.SymbolVersion);
+        }
+    }
+
     [Theory]
     [InlineData("A")]
     [InlineData("HELLO")]

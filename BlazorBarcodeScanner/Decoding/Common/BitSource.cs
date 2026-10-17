@@ -85,7 +85,7 @@ public ref struct BitSource
     /// <param name="value">The bits that were read.</param>
     public bool TryReadBits(int count, out int value)
     {
-        if (count < 1 || count > Available)
+        if (count is < 1 or > 32 || count > Available)
         {
             value = 0;
             return false;

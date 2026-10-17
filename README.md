@@ -83,7 +83,7 @@ The camera API also requires a secure context, so serve the application over HTT
 | `Facing` | `CameraFacing` | `Rear` | Preferred camera when no device id is given. |
 | `DeviceId` | `string?` | `null` | A specific camera to open. Changing it while running switches cameras. |
 | `AutoStart` | `bool` | `true` | Open the camera as soon as the component is ready. |
-| `DuplicateSuppressionWindow` | `TimeSpan` | 2 s | How long an identical value stays suppressed. |
+| `DuplicateSuppressionWindow` | `TimeSpan?` | `null` (2 s) | How long an identical value stays suppressed. When set it overrides `Options`; when not, `Options` decides, else 2 s. |
 | `ShowControls`, `ShowStatusBar`, `ShowReticle`, `ShowMask`, `HighlightResults` | `bool` | `true` | Built-in chrome. |
 | `EnableFileScanning` | `bool` | `true` | Offer still image scanning. |
 | `Fill` | `bool` | `false` | Fill the parent instead of keeping the camera's aspect ratio. |
@@ -179,7 +179,7 @@ overriding a single selector, and without depending on stylesheet order:
 
 Because the properties are read on the root element, setting them on an ancestor works too.
 
-The full list is in [`blazor-barcode-scanner.css`](src/BlazorBarcodeScanner/wwwroot/blazor-barcode-scanner.css) and on the
+The full list is in [`blazor-barcode-scanner.css`](BlazorBarcodeScanner/wwwroot/blazor-barcode-scanner.css) and on the
 demo's customisation page.
 
 The component is a labelled region, the controls are real buttons with pressed state, results are
@@ -250,10 +250,17 @@ round trips. What that establishes:
 
 What it does not do: read symbols whose modules are below about two pixels, recover from blur
 much wider than a module, or read a linear symbol rotated more than 30 degrees during live
-scanning. Misreading is treated as worse than missing throughout: ITF and unchecked Code 39
-results must repeat on a second scan line before they are reported, guard patterns must be
-adjacent rather than merely present, and a Data Matrix grid must have a plausible finder and
-timing pattern before its codewords are trusted.
+scanning. Misreading is treated as worse than missing throughout: ITF, UPC-E and unchecked
+Code 39 results must repeat on a second scan line before they are reported, guard patterns must
+be adjacent rather than merely present, a Reed–Solomon correction is only accepted when the
+corrected block re-verifies, and a Data Matrix grid must have a plausible finder and timing
+pattern before its codewords are trusted.
+
+Character sets: UTF-8, ISO-8859-1, UTF-16BE and ASCII are always available. QR Kanji and Hanzi
+segments and the East Asian ECIs (Shift JIS, GB 2312, Big5, KS X 1001, GB 18030) decode to text
+when the application has registered `CodePagesEncodingProvider` before the first scan; without
+it the text carries replacement characters for those segments and `RawBytes` carries the exact
+bytes, so nothing is lost.
 
 ## Performance
 
@@ -328,7 +335,7 @@ What costs what:
 Run them yourself:
 
 ```bash
-dotnet run -c Release --project src/tests/BlazorBarcodeScanner.Benchmarks -- --filter '*DecoderBenchmarks*'
+dotnet run -c Release --project Test/BlazorBarcodeScanner.Benchmarks -- --filter '*DecoderBenchmarks*'
 ```
 
 The benchmark host verifies that every frame still decodes before taking any timing, because a
@@ -425,12 +432,12 @@ starting with a bar.
 ## Repository layout
 
 ```
-src/BlazorBarcodeScanner                     the library
-src/BlazorBarcodeScanner.Demo                documentation site and reference implementation
-src/tests/BlazorBarcodeScanner.TestKit       encoders and image helpers, shared by tests, benchmarks and the demo
-src/tests/BlazorBarcodeScanner.Tests         unit, round-trip and image robustness tests
-src/tests/BlazorBarcodeScanner.E2E           browser tests: a real page, a real camera stream
-src/tests/BlazorBarcodeScanner.Benchmarks    BenchmarkDotNet suites
+BlazorBarcodeScanner                     the library
+Demo                                     documentation site and reference implementation
+Test/BlazorBarcodeScanner.TestKit        encoders and image helpers, shared by tests, benchmarks and the demo
+Test/BlazorBarcodeScanner.Tests          unit, round-trip and image robustness tests
+Test/BlazorBarcodeScanner.E2E            browser tests: a real page, a real camera stream
+Test/BlazorBarcodeScanner.Benchmarks     BenchmarkDotNet suites
 ```
 
 The encoders live in the test kit, not in the library: the library only reads barcodes. They exist
@@ -440,9 +447,9 @@ demo can render real, scannable symbols.
 ## Building and testing
 
 ```bash
-dotnet build src/BlazorBarcodeScanner.slnx
-dotnet test src/BlazorBarcodeScanner.slnx
-dotnet run --project src/BlazorBarcodeScanner.Demo
+dotnet build BlazorBarcodeScanner.slnx
+dotnet test BlazorBarcodeScanner.slnx
+dotnet run --project Demo
 ```
 
 The demo doubles as the documentation site: a live playground for every parameter, generated
@@ -470,7 +477,7 @@ control, scan regions, image scanning, customisation and error handling.
 
 ### Browser tests
 
-`src/tests/BlazorBarcodeScanner.E2E` runs the demo in a real browser whose camera is a generated
+`Test/BlazorBarcodeScanner.E2E` runs the demo in a real browser whose camera is a generated
 video file, so the whole stack is exercised: the WebAssembly runtime, the JavaScript module, a
 real `MediaStream`, the frame loop and the decoder. Only the sensor is synthetic.
 
@@ -484,5 +491,5 @@ The tests drive an installed Chrome or Edge, so there is no browser download ste
 present they skip.
 
 ```bash
-dotnet test src/tests/BlazorBarcodeScanner.E2E
+dotnet test Test/BlazorBarcodeScanner.E2E
 ```

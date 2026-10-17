@@ -150,11 +150,21 @@ navigator.mediaDevices.getUserMedia = async (constraints) => {
         return values;
     }
 
-    /// <summary>Reads the JavaScript heap size, for leak checks across long runs.</summary>
+    /// <summary>
+    /// Reads the JavaScript heap size after a full collection, for leak checks across long runs.
+    /// </summary>
+    /// <remarks>
+    /// V8 lets garbage pile up while memory is plentiful, so the raw figure says nothing about
+    /// what is actually reachable. The browser is launched with <c>--expose-gc</c>; collecting
+    /// twice settles objects whose finalisers free further memory.
+    /// </remarks>
     public async Task<long> HeapBytesAsync()
     {
         var value = await Page.EvaluateAsync<long?>(
-            "() => performance.memory ? performance.memory.usedJSHeapSize : null").ConfigureAwait(false);
+            @"() => {
+                if (typeof window.gc === 'function') { window.gc(); window.gc(); }
+                return performance.memory ? performance.memory.usedJSHeapSize : null;
+            }").ConfigureAwait(false);
         return value ?? 0;
     }
 

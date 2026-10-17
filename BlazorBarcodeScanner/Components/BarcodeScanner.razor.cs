@@ -78,8 +78,9 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
     public ScanRegion Region { get; set; } = ScanRegion.Full;
 
     /// <summary>
-    /// Advanced tuning. When supplied, <see cref="Formats"/> and <see cref="Region"/> are still
-    /// applied on top of it, so the common cases do not need this at all.
+    /// Advanced tuning. When supplied, <see cref="Formats"/>, <see cref="Region"/> and an
+    /// explicitly set <see cref="DuplicateSuppressionWindow"/> are still applied on top of it,
+    /// so the common cases do not need this at all.
     /// </summary>
     [Parameter]
     public ScannerOptions? Options { get; set; }
@@ -119,9 +120,12 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
     [Parameter]
     public bool AutoStart { get; set; } = true;
 
-    /// <summary>How long the same value is suppressed after being reported.</summary>
+    /// <summary>
+    /// How long the same value is suppressed after being reported. When not set, the value from
+    /// <see cref="Options"/> applies, and failing that two seconds.
+    /// </summary>
     [Parameter]
-    public TimeSpan DuplicateSuppressionWindow { get; set; } = TimeSpan.FromSeconds(2);
+    public TimeSpan? DuplicateSuppressionWindow { get; set; }
 
     /// <summary>Show the built-in control bar.</summary>
     [Parameter]
@@ -256,7 +260,7 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
                 // The rest is live-editable, so a running scanner picks up parameter changes
                 // without dropping the camera.
                 _decoder.Options.Region = _region;
-                _decoder.DuplicateSuppressionWindow = Options?.DuplicateSuppressionWindow ?? DuplicateSuppressionWindow;
+                _decoder.DuplicateSuppressionWindow = EffectiveDuplicateWindow();
             }
         }
 
@@ -610,6 +614,10 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
             return;
         }
 
+        // A faulted scanner is showing why it faulted; the still image path borrows the message
+        // slot while it works and gives the fault message back afterwards, so a user who scans
+        // a file after the camera failed is not left with a faulted status and no explanation.
+        var previousMessage = _status == ScannerStatus.Faulted ? _message : null;
         SetMessage("Reading image...");
 
         int packed;
@@ -634,7 +642,7 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
 
         if (packed <= 0)
         {
-            SetMessage(null);
+            SetMessage(previousMessage);
             return;
         }
 
@@ -663,7 +671,7 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
             return;
         }
 
-        SetMessage(result is null ? "No barcode found in that image." : null);
+        SetMessage(result is null ? "No barcode found in that image." : previousMessage);
 
         if (result is not null)
         {
@@ -1017,12 +1025,19 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
     {
         baseOptions.Formats = Formats;
         baseOptions.Region = _region;
-        if (Options is null)
-        {
-            baseOptions.DuplicateSuppressionWindow = DuplicateSuppressionWindow;
-        }
-
+        baseOptions.DuplicateSuppressionWindow = EffectiveDuplicateWindow();
         return baseOptions;
+    }
+
+    /// <summary>
+    /// The suppression window in force: the parameter when the application set one, otherwise
+    /// whatever <see cref="Options"/> carries, otherwise the library default. A negative value
+    /// is treated as zero rather than left to throw inside the decoder.
+    /// </summary>
+    private TimeSpan EffectiveDuplicateWindow()
+    {
+        var window = DuplicateSuppressionWindow ?? Options?.DuplicateSuppressionWindow ?? TimeSpan.FromSeconds(2);
+        return window < TimeSpan.Zero ? TimeSpan.Zero : window;
     }
 
     /// <summary>
@@ -1182,10 +1197,13 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
 
     private string ReticleStyle()
     {
+        // Physical rather than logical properties: the box maps camera pixels, and the camera
+        // frame does not flip in a right-to-left document, so the mask, the reticle and the
+        // highlight must all agree on where "left" is.
         var (left, top, width, height) = FrameToView(_region.X, _region.Y, _region.Width, _region.Height);
         return string.Create(
             CultureInfo.InvariantCulture,
-            $"inset-inline-start:{left * 100:0.##}%;inset-block-start:{top * 100:0.##}%;inline-size:{width * 100:0.##}%;block-size:{height * 100:0.##}%");
+            $"left:{left * 100:0.##}%;top:{top * 100:0.##}%;width:{width * 100:0.##}%;height:{height * 100:0.##}%");
     }
 
     /// <summary>
@@ -1219,6 +1237,13 @@ public sealed partial class BarcodeScanner : ComponentBase, IAsyncDisposable
 
         return aspect is null ? extra : $"{extra.TrimEnd().TrimEnd(';')};{aspect}";
     }
+
+    /// <summary>
+    /// Formats a number for an HTML attribute. Attribute values are rendered with the current
+    /// culture, and a browser reads <c>step="0,1"</c> as invalid and silently falls back to a
+    /// step of one, so numeric attributes always go through the invariant culture.
+    /// </summary>
+    private static string Invariant(double value) => value.ToString(CultureInfo.InvariantCulture);
 
     private string StatusText() => _status switch
     {

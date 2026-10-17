@@ -6,6 +6,7 @@ using Xunit;
 namespace BlazorBarcodeScanner.Tests;
 
 /// <summary>Exercises the end to end pipeline the way an application uses it.</summary>
+[Collection(AllocationSensitiveCollection.Name)]
 public class BarcodeDecoderTests
 {
     private static LuminanceBuffer RenderQr(string content) =>

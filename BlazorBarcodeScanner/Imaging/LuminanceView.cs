@@ -116,10 +116,14 @@ public readonly struct LuminanceView
         }
 
         region = region.Normalized();
-        var x = (int)(region.X * Width);
-        var y = (int)(region.Y * Height);
-        var w = Math.Max(1, Math.Min(Width - x, (int)(region.Width * Width)));
-        var h = Math.Max(1, Math.Min(Height - y, (int)(region.Height * Height)));
+
+        // A region whose edge sits exactly on the far side of the frame, or one with no area,
+        // still has to yield a window inside the buffer: the pipeline treats "nothing to scan"
+        // as a frame with no symbol, never as an exception.
+        var x = Math.Clamp((int)(region.X * Width), 0, Math.Max(0, Width - 1));
+        var y = Math.Clamp((int)(region.Y * Height), 0, Math.Max(0, Height - 1));
+        var w = Math.Clamp((int)(region.Width * Width), 1, Math.Max(1, Width - x));
+        var h = Math.Clamp((int)(region.Height * Height), 1, Math.Max(1, Height - y));
         return Crop(x, y, w, h);
     }
 }

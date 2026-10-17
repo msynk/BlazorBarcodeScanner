@@ -481,12 +481,13 @@ public sealed class BarcodeDecoder : IDisposable
     /// only accepted when both lines agree. A scan line that leaves a symbol through its edge
     /// can assemble a shorter, internally valid value; the same accident almost never repeats a
     /// few pixels away, whereas a genuine symbol reads identically on every line that crosses it.
+    /// UPC-E is included because the left half of a damaged EAN-13 reads as one.
     /// </summary>
     private bool IsConfirmed(
         in LuminanceView view, SymbolDecodeResult result,
         float px, float py, float nx, float ny, float dx, float dy, bool inverted)
     {
-        var needsConfirmation = result.Format == BarcodeFormat.Itf ||
+        var needsConfirmation = result.Format is BarcodeFormat.Itf or BarcodeFormat.UpcE ||
                                 (result.Format == BarcodeFormat.Code39 && !_options.Code39CheckDigit);
         if (!needsConfirmation)
         {

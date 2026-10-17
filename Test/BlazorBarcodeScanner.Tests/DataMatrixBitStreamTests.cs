@@ -88,6 +88,28 @@ public class DataMatrixBitStreamTests
         Assert.Equal(26, result.Eci);
     }
 
+    [Theory]
+    [InlineData(241, 0, 'A' + 1)]
+    [InlineData(241, 131, 0, 'A' + 1)]
+    [InlineData(241, 131, 255, 'A' + 1)]
+    [InlineData(241, 200, 0, 9, 'A' + 1)]
+    [InlineData(241, 200, 5, 255, 'A' + 1)]
+    public void AnEciWithAnUndefinedCodewordIsRejected(params int[] codewords)
+    {
+        // Codeword 0 is undefined in every position of an ECI and the continuation codewords
+        // run from 1 to 254; accepting them produced assignment numbers such as -1.
+        Assert.Null(DataMatrixBitStreamParser.Decode(Pad(codewords), Version, 0));
+    }
+
+    [Fact]
+    public void C40Shift3RejectsValuesOutsideItsSet()
+    {
+        // 230 latches C40; shift 3 (value 2) followed by 32 is outside the thirty two character
+        // shift 3 set. Encoded as the triple (2, 32, 0): value = 1600 * 2 + 40 * 32 + 0 + 1.
+        const int Value = (1600 * 2) + (40 * 32) + 0 + 1;
+        Assert.Null(DataMatrixBitStreamParser.Decode(Pad(230, Value >> 8, Value & 0xFF, 254), Version, 0));
+    }
+
     [Fact]
     public void DecodesTheTwoCodewordEciForm()
     {

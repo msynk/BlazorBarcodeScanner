@@ -308,7 +308,14 @@ public static class DataMatrixBitStreamParser
             return false;
         }
 
+        // Codeword value 0 is not defined in any position of an ECI, and the continuation
+        // codewords run from 1 to 254; anything else is a corrupted stream.
         var first = bits.ReadBits(8);
+        if (first == 0)
+        {
+            return false;
+        }
+
         if (first <= 127)
         {
             eci = first - 1;
@@ -322,7 +329,13 @@ public static class DataMatrixBitStreamParser
                 return false;
             }
 
-            eci = ((first - 128) * 254) + bits.ReadBits(8) - 1 + 127;
+            var continuation = bits.ReadBits(8);
+            if (continuation is < 1 or > 254)
+            {
+                return false;
+            }
+
+            eci = ((first - 128) * 254) + continuation - 1 + 127;
             return true;
         }
 
@@ -333,6 +346,11 @@ public static class DataMatrixBitStreamParser
 
         var second = bits.ReadBits(8);
         var third = bits.ReadBits(8);
+        if (second is < 1 or > 254 || third is < 1 or > 254)
+        {
+            return false;
+        }
+
         eci = ((first - 192) * 64516) + ((second - 1) * 254) + third - 1 + 16383;
         return true;
     }
@@ -430,6 +448,13 @@ public static class DataMatrixBitStreamParser
                         }
                         else
                         {
+                            // The C40 shift 3 set holds the thirty two characters from the
+                            // grave accent to DEL; the remaining values are undefined.
+                            if (value >= 32)
+                            {
+                                return false;
+                            }
+
                             result.Append(upperShift ? (char)(value + 224) : (char)(value + 96));
                         }
 

@@ -68,23 +68,22 @@ public sealed class Pdf417Reader : IMatrixDecoder
             return null;
         }
 
-        if (rows.Count != rowCount)
-        {
-            return null;
-        }
-
+        // Rows the detector never saw, and rows it saw with the wrong number of characters,
+        // become erasures: the error correction stage decides whether the symbol survives them,
+        // which is what the security level is for.
         var codewords = new int[rowCount * columnCount];
-        var offset = 0;
+        Array.Fill(codewords, Pdf417Detector.Erasure);
         foreach (var row in rows)
         {
-            if (row.Codewords.Length != columnCount + 2)
+            if (row.RowNumber >= rowCount || row.Codewords.Length != columnCount + 2)
             {
-                return null;
+                continue;
             }
 
+            var offset = row.RowNumber * columnCount;
             for (var i = 1; i <= columnCount; i++)
             {
-                codewords[offset++] = row.Codewords[i];
+                codewords[offset + i - 1] = row.Codewords[i];
             }
         }
 
@@ -94,7 +93,16 @@ public sealed class Pdf417Reader : IMatrixDecoder
             return null;
         }
 
-        if (!_errorCorrection.TryDecode(codewords, numEcCodewords, out var errorsCorrected))
+        var erasures = new List<int>();
+        for (var i = 0; i < codewords.Length; i++)
+        {
+            if (codewords[i] == Pdf417Detector.Erasure)
+            {
+                erasures.Add(i);
+            }
+        }
+
+        if (!_errorCorrection.TryDecode(codewords, numEcCodewords, erasures, out var errorsCorrected))
         {
             return null;
         }
@@ -127,8 +135,8 @@ public sealed class Pdf417Reader : IMatrixDecoder
     /// <remarks>
     /// Each row indicator carries one third of the structure, chosen by the row number modulo
     /// three, and the left and right indicators of a row carry different thirds. Reading both
-    /// sides of the first three rows gives every value twice, which is what makes this robust on
-    /// a symbol whose edge is partly damaged.
+    /// sides of every row gives each value many times over, which is what makes this robust on a
+    /// symbol whose edge is partly damaged; an indicator the detector could not read is skipped.
     /// </remarks>
     private static bool TryReadStructure(
         IReadOnlyList<Pdf417Detector.SymbolRow> rows, out int rowCount, out int columnCount, out int errorCorrectionLevel)
@@ -142,36 +150,20 @@ public sealed class Pdf417Reader : IMatrixDecoder
         int? level = null;
         int? columns = null;
 
-        for (var index = 0; index < rows.Count; index++)
+        foreach (var row in rows)
         {
-            var row = rows[index];
-            var left = row.Codewords[0] % 30;
-            var right = row.Codewords[^1] % 30;
+            var phase = row.RowNumber % 3;
+            var left = row.Codewords[0];
+            var right = row.Codewords[^1];
 
-            // The cluster the codeword was read from gives the row number modulo three directly,
-            // without having to trust that detection started on row zero.
-            var phase = row.Clusters[0] / 3;
-            if (phase is < 0 or > 2)
+            if (left != Pdf417Detector.Erasure)
             {
-                return false;
+                Apply(phase, left % 30, isLeft: true);
             }
 
-            switch (phase)
+            if (right != Pdf417Detector.Erasure)
             {
-                case 0:
-                    rowsDiv3 ??= left;
-                    columns ??= right;
-                    break;
-                case 1:
-                    level ??= left / 3;
-                    rowsMod3 ??= left % 3;
-                    rowsDiv3 ??= right;
-                    break;
-                default:
-                    columns ??= left;
-                    level ??= right / 3;
-                    rowsMod3 ??= right % 3;
-                    break;
+                Apply(phase, right % 30, isLeft: false);
             }
 
             if (rowsDiv3 is not null && rowsMod3 is not null && level is not null && columns is not null)
@@ -192,5 +184,25 @@ public sealed class Pdf417Reader : IMatrixDecoder
         return rowCount is >= 3 and <= 90
             && columnCount is >= 1 and <= 30
             && errorCorrectionLevel is >= 0 and <= 8;
+
+        // The left indicator of phase p carries field p; the right indicator carries the field
+        // two rows along, so between them each row holds two of the three fields.
+        void Apply(int phase, int value, bool isLeft)
+        {
+            var field = isLeft ? phase : (phase + 2) % 3;
+            switch (field)
+            {
+                case 0:
+                    rowsDiv3 ??= value;
+                    break;
+                case 1:
+                    level ??= value / 3;
+                    rowsMod3 ??= value % 3;
+                    break;
+                default:
+                    columns ??= value;
+                    break;
+            }
+        }
     }
 }

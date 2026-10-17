@@ -15,10 +15,12 @@ namespace BlazorBarcodeScanner.Decoding.Pdf417;
 /// at that point in the row.
 /// </para>
 /// <para>
-/// The number of rows is not known in advance, so every image row that yields a complete codeword
-/// sequence is decoded and consecutive image rows that produce identical sequences are collapsed
-/// into one symbol row. That is both simpler and more tolerant of row height variation than
-/// trying to derive the row pitch geometrically.
+/// Every image row that yields a codeword sequence is assigned to a symbol row by its row
+/// indicator, which carries the row number: comparing neighbouring image rows for equality would
+/// merge two different symbol rows that happen to carry the same codewords, and would split one
+/// symbol row in two at the first scan line a speck of dust corrupts. The scan lines of a symbol
+/// row then vote on every codeword, and a codeword no scan line could read is reported as an
+/// erasure for the error correction stage rather than discarding the row.
 /// </para>
 /// </remarks>
 public sealed class Pdf417Detector
@@ -32,17 +34,35 @@ public sealed class Pdf417Detector
     private const float MaxAvgVariance = 0.42f;
     private const float MaxIndividualVariance = 0.8f;
 
+    /// <summary>Marks a codeword position no scan line could read.</summary>
+    public const int Erasure = -1;
+
     /// <summary>One decoded symbol row.</summary>
-    /// <param name="Codewords">Every codeword of the row, including both row indicators.</param>
-    /// <param name="Clusters">The cluster number each codeword was read from.</param>
+    /// <param name="RowNumber">The zero based row number carried by the row indicators.</param>
+    /// <param name="Codewords">Every codeword of the row, including both row indicators; <see cref="Erasure"/> where unreadable.</param>
+    /// <param name="Clusters">The cluster number each codeword belongs to, which is fixed by the row number.</param>
     /// <param name="Top">First image row this symbol row was seen on.</param>
     /// <param name="Bottom">Last image row this symbol row was seen on.</param>
     /// <param name="Left">X of the first module of the start pattern.</param>
     /// <param name="Right">X just past the last module of the stop pattern.</param>
-    public sealed record SymbolRow(int[] Codewords, int[] Clusters, int Top, int Bottom, int Left, int Right);
+    public sealed record SymbolRow(int RowNumber, int[] Codewords, int[] Clusters, int Top, int Bottom, int Left, int Right);
+
+    /// <summary>The scan lines gathered for one symbol row before they vote.</summary>
+    private sealed class RowAccumulator(int top, int left, int right)
+    {
+        public List<int[]> ScanLines { get; } = [];
+
+        public int Top { get; } = top;
+
+        public int Bottom { get; set; } = top;
+
+        public int Left { get; set; } = left;
+
+        public int Right { get; set; } = right;
+    }
 
     /// <summary>
-    /// Scans the image and returns the symbol rows it found, in top to bottom order.
+    /// Scans the image and returns the symbol rows it found, in row number order.
     /// </summary>
     /// <param name="image">The binarised image.</param>
     /// <param name="table">The symbol character table to decode with.</param>
@@ -52,8 +72,7 @@ public sealed class Pdf417Detector
         ArgumentNullException.ThrowIfNull(image);
         ArgumentNullException.ThrowIfNull(table);
 
-        var rows = new List<SymbolRow>();
-        int[]? previous = null;
+        var accumulators = new SortedDictionary<int, RowAccumulator>();
 
         Span<int> counters = stackalloc int[9];
 
@@ -61,40 +80,137 @@ public sealed class Pdf417Detector
         {
             if (!TryFindPattern(image, y, 0, StartPattern, counters, out var startBegin, out var startEnd))
             {
-                previous = null;
                 continue;
             }
 
             if (!TryFindPattern(image, y, startEnd, StopPattern, counters, out var stopBegin, out var stopEnd))
             {
-                previous = null;
                 continue;
             }
 
             var codewords = TryReadRow(image, y, startEnd, stopBegin, table, out var clusters);
             if (codewords is null)
             {
-                previous = null;
                 continue;
             }
 
-            // Consecutive image rows that decode identically belong to the same symbol row.
-            if (previous is not null && codewords.AsSpan().SequenceEqual(previous))
+            var rowNumber = RowNumberOf(codewords, clusters!);
+            if (rowNumber < 0)
             {
-                var last = rows[^1];
-                rows[^1] = last with { Bottom = y };
                 continue;
             }
 
-            rows.Add(new SymbolRow(codewords, clusters!, y, y, startBegin, stopEnd));
-            previous = codewords;
+            if (!accumulators.TryGetValue(rowNumber, out var accumulator))
+            {
+                accumulator = new RowAccumulator(y, startBegin, stopEnd);
+                accumulators.Add(rowNumber, accumulator);
+            }
+
+            accumulator.ScanLines.Add(codewords);
+            accumulator.Bottom = y;
+            accumulator.Left = Math.Min(accumulator.Left, startBegin);
+            accumulator.Right = Math.Max(accumulator.Right, stopEnd);
+        }
+
+        if (accumulators.Count == 0)
+        {
+            return [];
+        }
+
+        // A row indicator misread as another valid codeword lands a scan line on a row number
+        // the symbol does not have. Such a row is seen on far fewer scan lines than a real one,
+        // whose height is several pixels, so rows well below the typical count are dropped.
+        var counts = accumulators.Values.Select(a => a.ScanLines.Count).Order().ToArray();
+        var median = counts[counts.Length / 2];
+
+        var rows = new List<SymbolRow>(accumulators.Count);
+        foreach (var (rowNumber, accumulator) in accumulators)
+        {
+            if (accumulator.ScanLines.Count * 2 < median)
+            {
+                continue;
+            }
+
+            var voted = Vote(accumulator.ScanLines);
+            var clusters = new int[voted.Length];
+            Array.Fill(clusters, (rowNumber % 3) * 3);
+            rows.Add(new SymbolRow(rowNumber, voted, clusters, accumulator.Top, accumulator.Bottom, accumulator.Left, accumulator.Right));
         }
 
         return rows;
     }
 
     /// <summary>
-    /// Reads the codewords between the start and stop patterns of one image row.
+    /// Derives the row number from whichever row indicator could be read: the indicator's value
+    /// divided by thirty gives the row number divided by three, and its cluster gives the row
+    /// number modulo three.
+    /// </summary>
+    private static int RowNumberOf(int[] codewords, int[] clusters)
+    {
+        var left = codewords[0];
+        if (left != Erasure && clusters[0] is 0 or 3 or 6)
+        {
+            return ((left / 30) * 3) + (clusters[0] / 3);
+        }
+
+        var right = codewords[^1];
+        if (right != Erasure && clusters[^1] is 0 or 3 or 6)
+        {
+            return ((right / 30) * 3) + (clusters[^1] / 3);
+        }
+
+        return -1;
+    }
+
+    /// <summary>
+    /// Combines the scan lines of one symbol row: the most common codeword count wins, and
+    /// within it every position takes its most frequent readable value.
+    /// </summary>
+    private static int[] Vote(List<int[]> scanLines)
+    {
+        var length = scanLines
+            .GroupBy(line => line.Length)
+            .OrderByDescending(group => group.Count())
+            .ThenByDescending(group => group.Key)
+            .First()
+            .Key;
+
+        var voted = new int[length];
+        var tally = new Dictionary<int, int>();
+        for (var position = 0; position < length; position++)
+        {
+            tally.Clear();
+            foreach (var line in scanLines)
+            {
+                if (line.Length != length || line[position] == Erasure)
+                {
+                    continue;
+                }
+
+                tally[line[position]] = tally.GetValueOrDefault(line[position]) + 1;
+            }
+
+            var best = Erasure;
+            var bestCount = 0;
+            foreach (var (value, count) in tally)
+            {
+                if (count > bestCount)
+                {
+                    best = value;
+                    bestCount = count;
+                }
+            }
+
+            voted[position] = best;
+        }
+
+        return voted;
+    }
+
+    /// <summary>
+    /// Reads the codewords between the start and stop patterns of one image row. A character
+    /// whose pattern is not in the table is recorded as <see cref="Erasure"/>; only a row whose
+    /// run structure is broken is rejected outright.
     /// </summary>
     private static int[]? TryReadRow(
         BitMatrix image, int y, int from, int to, Pdf417SymbolTable table, out int[]? clusters)
@@ -124,7 +240,8 @@ public sealed class Pdf417Detector
             var pattern = Pdf417SymbolTable.ToPattern(widths);
             if (!table.TryGetCodeword(cluster, pattern, out var codeword))
             {
-                return null;
+                codeword = Erasure;
+                cluster = -1;
             }
 
             codewords.Add(codeword);

@@ -132,6 +132,122 @@ public class Pdf417DecoderTests
     }
 
     [Fact]
+    public void AdjacentRowsWithIdenticalCodewordsAreNotMerged()
+    {
+        // Two columns, no error correction: rows 1 and 2 both carry "AB AB" style repeats plus
+        // identical indicators in their low part, so a detector that merges neighbouring image
+        // rows by codeword equality alone collapses them and loses a row.
+        const string Content = "ABABABABABAB";
+        using var matrix = Pdf417Encoder.Encode(Content, columns: 2, errorCorrectionLevel: 0);
+
+        var result = new Pdf417Reader().Decode(matrix, MatrixDecodeOptions.Live);
+
+        Assert.NotNull(result);
+        Assert.Equal(Content, result.Payload.Text);
+    }
+
+    [Fact]
+    public void ASingleCorruptedScanLineDoesNotSplitARow()
+    {
+        const string Content = "ONE BAD PIXEL";
+        using var matrix = Pdf417Encoder.Encode(Content, columns: 3, errorCorrectionLevel: 2, rowHeightModules: 3);
+
+        // Flip one module in the middle scan line of the second symbol row. The other two scan
+        // lines of that row still read correctly and must outvote it.
+        var y = 4;
+        var x = matrix.Width / 2;
+        matrix[x, y] = !matrix[x, y];
+
+        var result = new Pdf417Reader().Decode(matrix, MatrixDecodeOptions.Live);
+
+        Assert.NotNull(result);
+        Assert.Equal(Content, result.Payload.Text);
+    }
+
+    [Fact]
+    public void AnUnreadableCodewordBecomesAnErasureRatherThanLosingTheRow()
+    {
+        const string Content = "ERASURE";
+        using var matrix = Pdf417Encoder.Encode(Content, columns: 3, errorCorrectionLevel: 3, rowHeightModules: 3);
+
+        // Black out the first data character of the second row on every one of its scan lines:
+        // the pattern is not in the table, so the detector cannot read it, and the error
+        // correction stage has to supply it.
+        var quiet = 2;
+        var start = quiet + 17 + 17; // quiet zone, start pattern, left indicator
+        for (var y = 3; y < 6; y++)
+        {
+            for (var x = start; x < start + 17; x++)
+            {
+                matrix[x, y] = true;
+            }
+        }
+
+        var result = new Pdf417Reader().Decode(matrix, MatrixDecodeOptions.Live);
+
+        Assert.NotNull(result);
+        Assert.Equal(Content, result.Payload.Text);
+        Assert.True(result.Payload.ErrorsCorrected >= 1);
+    }
+
+    [Fact]
+    public void AByteShiftInsideTextResumesThePriorSubMode()
+    {
+        // Text: latch to lower, "abc", shift to byte for '!', then "de" which must still be lower case.
+        int[] codewords = [7, 900, (27 * 30) + 0, (1 * 30) + 2, 913, '!', (3 * 30) + 4];
+
+        var result = Pdf417BitStreamParser.Decode(codewords, 3, 3, 0, 0);
+
+        Assert.NotNull(result);
+        Assert.Equal("abc!de", result.Text);
+    }
+
+    [Fact]
+    public void EciIsAppliedToByteCompactedText()
+    {
+        var utf8 = System.Text.Encoding.UTF8.GetBytes("héllo");
+        Assert.Equal(6, utf8.Length);
+
+        // One full group of six bytes, as five base 900 codewords.
+        long value = 0;
+        foreach (var b in utf8)
+        {
+            value = (value << 8) | b;
+        }
+
+        var group = new int[5];
+        for (var i = 4; i >= 0; i--)
+        {
+            group[i] = (int)(value % 900);
+            value /= 900;
+        }
+
+        int[] codewords = [9, 927, 26, 924, .. group];
+
+        var result = Pdf417BitStreamParser.Decode(codewords, 3, 3, 0, 0);
+
+        Assert.NotNull(result);
+        Assert.Equal("héllo", result.Text);
+        Assert.Equal(26, result.Eci);
+        Assert.Equal(utf8, result.RawBytes);
+    }
+
+    [Fact]
+    public void MacroControlBlockReportsTheSegmentIndexAndCount()
+    {
+        // Payload "A" in text, then 928, segment index 5 ("100005" = 111 * 900 + 105), file id
+        // codewords, optional field 1 holding the segment count 3 ("100003"), terminator.
+        int[] codewords = [13, 900, (0 * 30) + 29, 928, 111, 105, 100, 200, 923, 1, 111, 103, 922];
+
+        var result = Pdf417BitStreamParser.Decode(codewords, 3, 4, 0, 0);
+
+        Assert.NotNull(result);
+        Assert.Equal("A", result.Text);
+        Assert.Equal(5, result.StructuredAppendIndex);
+        Assert.Equal(3, result.StructuredAppendCount);
+    }
+
+    [Fact]
     public void ShippedSymbolTableIsMarkedAsAPlaceholder()
     {
         Assert.False(

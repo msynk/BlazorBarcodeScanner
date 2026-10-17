@@ -20,10 +20,54 @@ public sealed class Pdf417ErrorCorrection
     /// <param name="numEcCodewords">Number of error correction codewords.</param>
     /// <param name="errorsCorrected">Number of codewords that had to be changed.</param>
     /// <returns><see langword="false"/> when the block carries more errors than it can correct.</returns>
-    public bool TryDecode(int[] received, int numEcCodewords, out int errorsCorrected)
+    public bool TryDecode(int[] received, int numEcCodewords, out int errorsCorrected) =>
+        TryDecode(received, numEcCodewords, erasures: null, out errorsCorrected);
+
+    /// <summary>
+    /// Repairs <paramref name="received"/> in place, given the positions the detector could not
+    /// read at all.
+    /// </summary>
+    /// <param name="received">Data codewords followed by error correction codewords; an erased position may hold any value.</param>
+    /// <param name="numEcCodewords">Number of error correction codewords.</param>
+    /// <param name="erasures">Indices into <paramref name="received"/> whose value is unknown, or <see langword="null"/>.</param>
+    /// <param name="errorsCorrected">Number of codewords that had to be changed, erasures included.</param>
+    /// <returns><see langword="false"/> when the block carries more damage than it can correct.</returns>
+    /// <remarks>
+    /// Erasures are corrected as ordinary errors, after being zeroed so that they hold a known
+    /// value: that spends two correction codewords on each instead of one, but it keeps a single
+    /// decoding path, and a symbol that needs the full erasure capacity is one the detector has
+    /// already lost most of.
+    /// </remarks>
+    public bool TryDecode(int[] received, int numEcCodewords, IReadOnlyList<int>? erasures, out int errorsCorrected)
     {
         ArgumentNullException.ThrowIfNull(received);
         errorsCorrected = 0;
+
+        if (erasures is not null)
+        {
+            if (erasures.Count > numEcCodewords / 2)
+            {
+                return false;
+            }
+
+            foreach (var position in erasures)
+            {
+                if ((uint)position >= (uint)received.Length)
+                {
+                    return false;
+                }
+
+                received[position] = 0;
+            }
+        }
+
+        foreach (var codeword in received)
+        {
+            if ((uint)codeword >= (uint)_field.Modulus)
+            {
+                return false;
+            }
+        }
 
         var poly = new ModulusPoly(_field, received);
         var syndromeCoefficients = new int[numEcCodewords];
@@ -50,7 +94,9 @@ public sealed class Pdf417ErrorCorrection
             return false;
         }
 
-        if (!TryFindErrorLocations(sigma, out var errorLocations))
+        // A locator of degree zero names no positions while the syndromes are non-zero: the
+        // damage could not be placed, so the block is rejected rather than passed on as is.
+        if (sigma.Degree == 0 || !TryFindErrorLocations(sigma, out var errorLocations))
         {
             return false;
         }
@@ -65,6 +111,17 @@ public sealed class Pdf417ErrorCorrection
             }
 
             received[position] = _field.Subtract(received[position], errorMagnitudes[i]);
+        }
+
+        // A block damaged beyond capacity can come out of the algorithm "corrected" into a
+        // different, wrong codeword; checking the syndromes again catches that.
+        poly = new ModulusPoly(_field, received);
+        for (var i = numEcCodewords; i > 0; i--)
+        {
+            if (poly.EvaluateAt(_field.Exp(i)) != 0)
+            {
+                return false;
+            }
         }
 
         errorsCorrected = errorLocations.Length;

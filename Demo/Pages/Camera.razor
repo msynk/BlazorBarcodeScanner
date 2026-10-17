@@ -124,10 +124,10 @@
                 <div class="field" style="margin-block-start:0.75rem;">
                     <label class="field__label">Zoom: @(_scanner?.Zoom.ToString("0.##"))</label>
                     <input type="range"
-                           min="@_camera.ZoomMin"
-                           max="@_camera.ZoomMax"
-                           step="@(_camera.ZoomStep > 0 ? _camera.ZoomStep : 0.1)"
-                           value="@_scanner?.Zoom"
+                           min="@Invariant(_camera.ZoomMin)"
+                           max="@Invariant(_camera.ZoomMax)"
+                           step="@Invariant(_camera.ZoomStep > 0 ? _camera.ZoomStep : 0.1)"
+                           value="@Invariant(_scanner?.Zoom ?? 0)"
                            @onchange="OnZoomChanged" />
                 </div>
             }
@@ -189,6 +189,9 @@
             await _scanner.SetZoomAsync(zoom);
         }
     }
+
+    // Numeric attributes must not pick up a culture specific decimal separator.
+    private static string Invariant(double value) => value.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
     private void OnFacingChanged(ChangeEventArgs args)
     {

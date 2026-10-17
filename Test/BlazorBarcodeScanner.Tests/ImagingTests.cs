@@ -26,6 +26,48 @@ public class ImagingTests
     }
 
     [Fact]
+    public void ReedSolomonRejectsABlockWhoseDamageCannotBePlaced()
+    {
+        // Four errors on a valid five-check-codeword block, arranged so that the top three
+        // syndromes vanish. The Euclidean step then never runs and the locator has degree
+        // zero, which used to be reported as a clean block.
+        int[] received = [18, 17, 129, 170, 206, 113, 94, 202];
+        var decoder = ReedSolomonDecoder.DataMatrix;
+
+        Assert.False(decoder.TryDecode(received, 5, out _));
+    }
+
+    [Fact]
+    public void ReedSolomonRejectsAMiscorrectionBeyondItsCapacity()
+    {
+        // A random block is almost never a codeword; whatever the algorithm makes of it, the
+        // result must either be a codeword or a rejection, never a wrong "correction".
+        var field = GenericGF.QrCodeField256;
+        var decoder = ReedSolomonDecoder.QrCode;
+        var random = new Random(4242);
+
+        for (var attempt = 0; attempt < 500; attempt++)
+        {
+            var block = new int[26];
+            for (var i = 0; i < block.Length; i++)
+            {
+                block[i] = random.Next(256);
+            }
+
+            if (!decoder.TryDecode(block, 7, out _))
+            {
+                continue;
+            }
+
+            var poly = new GfPoly(field, block);
+            for (var i = 0; i < 7; i++)
+            {
+                Assert.Equal(0, poly.EvaluateAt(field.Exp(i)));
+            }
+        }
+    }
+
+    [Fact]
     public void BitRowReverseIsItsOwnInverse()
     {
         var random = new Random(11);

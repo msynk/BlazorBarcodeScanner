@@ -54,6 +54,12 @@ public sealed class QrDetector
     /// before the caller ever sees it, which costs one pass over two lines of modules and
     /// removes almost every wrong grid.
     /// </para>
+    /// <para>
+    /// The finder patterns themselves are a guess too. The finder returns its triples ranked by
+    /// how well they fit the corners of a symbol, and a triple that includes a false centre
+    /// usually fails the dimension estimate or the timing check, so the detector moves on to the
+    /// next triple rather than giving up.
+    /// </para>
     /// </remarks>
     /// <param name="tryHarder">When <see langword="true"/> the finder pattern search scans every row.</param>
     /// <param name="accept">Called with each candidate; returning <see langword="true"/> ends the search.</param>
@@ -63,15 +69,24 @@ public sealed class QrDetector
         ArgumentNullException.ThrowIfNull(accept);
 
         _finder.Reset(_image);
-        if (!_finder.TryFind(tryHarder, out var patterns))
+        var triples = _finder.FindCandidates(tryHarder);
+        foreach (var triple in triples)
         {
-            return null;
+            if (DetectFrom(triple.TopLeft, triple.TopRight, triple.BottomLeft, accept) is { } result)
+            {
+                return result;
+            }
         }
 
-        var bottomLeft = patterns[0];
-        var topLeft = patterns[1];
-        var topRight = patterns[2];
+        return null;
+    }
 
+    private DetectorResult? DetectFrom(
+        QrFinderPattern topLeft,
+        QrFinderPattern topRight,
+        QrFinderPattern bottomLeft,
+        Func<DetectorResult, bool> accept)
+    {
         // Written this way so that a NaN, which every comparison answers false to, is rejected
         // rather than carried into the dimension estimate.
         var moduleSize = CalculateModuleSize(topLeft, topRight, bottomLeft);

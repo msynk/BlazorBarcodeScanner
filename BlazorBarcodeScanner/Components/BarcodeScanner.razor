@@ -110,10 +110,10 @@
                 <input class="bscan__range"
                        type="range"
                        aria-label="Zoom"
-                       min="@_camera.ZoomMin"
-                       max="@_camera.ZoomMax"
-                       step="@(_camera.ZoomStep > 0 ? _camera.ZoomStep : 0.1)"
-                       value="@_zoom"
+                       min="@Invariant(_camera.ZoomMin)"
+                       max="@Invariant(_camera.ZoomMax)"
+                       step="@Invariant(_camera.ZoomStep > 0 ? _camera.ZoomStep : 0.1)"
+                       value="@Invariant(_zoom)"
                        @onchange="OnZoomChangedAsync" />
             }
 

@@ -77,6 +77,10 @@
     forced-color-adjust: none;
 }
 
+/* The reticle box, the mask hole and the result highlight are positioned in camera frame
+   coordinates, which do not flip with the writing direction: a symbol on the left of the frame
+   is on the left of the video whatever the document's direction. Their geometry therefore uses
+   physical properties, set inline by the component; everything else in the file is logical. */
 .bscan__reticle {
     position: absolute;
     pointer-events: none;
@@ -146,15 +150,15 @@
    properties set by the component, so updating it never re-renders the rest of the tree. */
 .bscan__hit {
     position: absolute;
-    inset-block-start: var(--bscan-hit-top, 0);
-    inset-inline-start: var(--bscan-hit-left, 0);
-    inline-size: var(--bscan-hit-width, 0);
-    block-size: var(--bscan-hit-height, 0);
+    top: var(--bscan-hit-top, 0);
+    left: var(--bscan-hit-left, 0);
+    width: var(--bscan-hit-width, 0);
+    height: var(--bscan-hit-height, 0);
     border: 2px solid var(--bscan-success);
     border-radius: 0.35rem;
     pointer-events: none;
-    transition: inset-block-start var(--bscan-transition), inset-inline-start var(--bscan-transition),
-        inline-size var(--bscan-transition), block-size var(--bscan-transition);
+    transition: top var(--bscan-transition), left var(--bscan-transition),
+        width var(--bscan-transition), height var(--bscan-transition);
     forced-color-adjust: none;
 }
 

@@ -9,10 +9,18 @@ namespace BlazorBarcodeScanner.Decoding.Pdf417;
 /// Turns the corrected codewords of a PDF417 symbol into the payload it encodes.
 /// </summary>
 /// <remarks>
+/// <para>
 /// PDF417 has three compaction modes and the payload latches between them. Text compaction packs
 /// two characters into every codeword through four sub-alphabets, byte compaction packs six bytes
 /// into every five codewords, and numeric compaction treats runs of digits as one large base 900
 /// number.
+/// </para>
+/// <para>
+/// The payload is assembled as bytes and interpreted as text afterwards, per ECI segment, the
+/// way the QR and Data Matrix parsers do: text and numeric compaction produce ASCII, so only
+/// byte compaction is affected by the character set, but a symbol that declares UTF-8 and then
+/// carries accented characters as bytes has to come out as the characters it meant.
+/// </para>
 /// </remarks>
 public static class Pdf417BitStreamParser
 {
@@ -50,6 +58,65 @@ public static class Pdf417BitStreamParser
         PunctuationShift,
     }
 
+    /// <summary>
+    /// The payload under construction: the raw bytes, plus the text decoded so far, which is
+    /// built one ECI segment at a time because a change of character set applies only to the
+    /// bytes that follow it.
+    /// </summary>
+    private sealed class Output
+    {
+        private readonly StringBuilder _text = new();
+        private readonly List<byte> _segment = [];
+        private int? _segmentEci;
+
+        public List<byte> Raw { get; } = [];
+
+        /// <summary>The last ECI declared by the symbol, as reported in the metadata.</summary>
+        public int? Eci { get; private set; }
+
+        public void Append(byte value)
+        {
+            Raw.Add(value);
+            _segment.Add(value);
+        }
+
+        public void Append(char value) => Append((byte)value);
+
+        public void SetEci(int eci)
+        {
+            Flush();
+            Eci = eci;
+
+            // Only the character set range of ECI carries an interpretation for bytes; the user
+            // defined and general purpose ranges are reported but do not change the text.
+            _segmentEci = eci <= 899 ? eci : null;
+        }
+
+        public string Text
+        {
+            get
+            {
+                Flush();
+                return _text.ToString();
+            }
+        }
+
+        private void Flush()
+        {
+            if (_segment.Count == 0)
+            {
+                return;
+            }
+
+            var bytes = _segment.ToArray();
+            var encoding = _segmentEci is int eci
+                ? CharacterSetEci.FromEci(eci)
+                : CharacterSetEci.GuessEncoding(bytes);
+            _text.Append(encoding.GetString(bytes));
+            _segment.Clear();
+        }
+    }
+
     /// <summary>Decodes the payload.</summary>
     /// <param name="codewords">Corrected codewords; index 0 is the symbol length descriptor.</param>
     /// <param name="rows">Number of symbol rows, reported back in the result.</param>
@@ -73,10 +140,8 @@ public static class Pdf417BitStreamParser
             return null;
         }
 
-        var result = new StringBuilder(length * 2);
-        var raw = new List<byte>(length * 2);
+        var output = new Output();
 
-        int? eci = null;
         int? segmentIndex = null;
         int? segmentCount = null;
 
@@ -88,16 +153,16 @@ public static class Pdf417BitStreamParser
             switch (codeword)
             {
                 case TextCompaction:
-                    index = DecodeText(codewords, index, length, result, raw);
+                    index = DecodeText(codewords, index, length, output);
                     break;
 
                 case ByteCompaction:
                 case ByteCompactionSixes:
-                    index = DecodeBytes(codewords, index, length, result, raw, codeword == ByteCompactionSixes);
+                    index = DecodeBytes(codewords, index, length, output, codeword == ByteCompactionSixes);
                     break;
 
                 case NumericCompaction:
-                    index = DecodeNumeric(codewords, index, length, result, raw);
+                    index = DecodeNumeric(codewords, index, length, output);
                     break;
 
                 case ShiftToByte:
@@ -106,26 +171,13 @@ public static class Pdf417BitStreamParser
                         return null;
                     }
 
-                    Append(result, raw, (char)(codewords[index++] & 0xFF));
+                    output.Append((byte)(codewords[index++] & 0xFF));
                     break;
 
                 case EciCharset:
                 case EciUserDefined:
-                    if (index >= length)
-                    {
-                        return null;
-                    }
-
-                    eci = codewords[index++];
-                    break;
-
                 case EciGeneralPurpose:
-                    if (index + 1 >= length)
-                    {
-                        return null;
-                    }
-
-                    index += 2;
+                    index = DecodeEci(codewords, index - 1, length, output);
                     break;
 
                 case MacroControlBlock:
@@ -134,7 +186,8 @@ public static class Pdf417BitStreamParser
 
                 case MacroOptionalField:
                 case MacroTerminator:
-                    // Optional macro fields carry metadata that is not part of the payload.
+                    // A stray optional field or terminator outside a control block carries
+                    // metadata that is not part of the payload.
                     index = length;
                     break;
 
@@ -147,7 +200,7 @@ public static class Pdf417BitStreamParser
                     }
 
                     // A stream that starts without an explicit latch is in text compaction.
-                    index = DecodeText(codewords, index - 1, length, result, raw);
+                    index = DecodeText(codewords, index - 1, length, output);
                     break;
             }
 
@@ -157,21 +210,68 @@ public static class Pdf417BitStreamParser
             }
         }
 
-        var text = result.ToString();
-        return new DecoderResult(raw.ToArray(), text)
+        return new DecoderResult([.. output.Raw], output.Text)
         {
             ErrorCorrectionLevel = errorCorrectionLevel.ToString(CultureInfo.InvariantCulture),
             SymbolVersion = $"{rows}x{columns}",
             ErrorsCorrected = errorsCorrected,
             Rows = rows,
             Columns = columns,
-            Eci = eci,
+            Eci = output.Eci,
             StructuredAppendIndex = segmentIndex,
             StructuredAppendCount = segmentCount,
         };
     }
 
-    private static int DecodeText(int[] codewords, int index, int length, StringBuilder result, List<byte> raw)
+    /// <summary>
+    /// Reads an ECI designator and the one or two codewords that follow it. The three
+    /// designators cover disjoint ranges of the assignment number space.
+    /// </summary>
+    /// <returns>The index after the ECI, or -1 when the stream ends inside it.</returns>
+    private static int DecodeEci(int[] codewords, int index, int length, Output output)
+    {
+        var designator = codewords[index++];
+        switch (designator)
+        {
+            case EciCharset:
+                if (index >= length || codewords[index] >= TextCompaction)
+                {
+                    return -1;
+                }
+
+                output.SetEci(codewords[index++]);
+                return index;
+
+            case EciGeneralPurpose:
+                if (index + 1 >= length || codewords[index] >= TextCompaction || codewords[index + 1] >= TextCompaction)
+                {
+                    return -1;
+                }
+
+                output.SetEci(900 + (codewords[index] * 900) + codewords[index + 1]);
+                return index + 2;
+
+            default:
+                if (index >= length || codewords[index] >= TextCompaction)
+                {
+                    return -1;
+                }
+
+                output.SetEci(810900 + codewords[index++]);
+                return index;
+        }
+    }
+
+    /// <summary>
+    /// Decodes a run of text compaction codewords.
+    /// </summary>
+    /// <remarks>
+    /// A byte shift, a text latch and an ECI designator may all appear inside a text run without
+    /// ending it: the shift emits one byte and leaves the sub-mode as it was, the latch resets
+    /// the sub-mode to Alpha, and the ECI changes only the character set. Any other mode codeword
+    /// ends the run.
+    /// </remarks>
+    private static int DecodeText(int[] codewords, int index, int length, Output output)
     {
         var mode = TextMode.Alpha;
         var priorToShift = TextMode.Alpha;
@@ -183,6 +283,37 @@ public static class Pdf417BitStreamParser
             var codeword = codewords[index];
             if (codeword >= TextCompaction)
             {
+                if (codeword == ShiftToByte)
+                {
+                    if (index + 1 >= length)
+                    {
+                        return -1;
+                    }
+
+                    output.Append((byte)(codewords[index + 1] & 0xFF));
+                    index += 2;
+                    continue;
+                }
+
+                if (codeword == TextCompaction)
+                {
+                    mode = TextMode.Alpha;
+                    priorToShift = TextMode.Alpha;
+                    index++;
+                    continue;
+                }
+
+                if (codeword is EciCharset or EciGeneralPurpose or EciUserDefined)
+                {
+                    index = DecodeEci(codewords, index, length, output);
+                    if (index < 0)
+                    {
+                        return -1;
+                    }
+
+                    continue;
+                }
+
                 break;
             }
 
@@ -198,11 +329,11 @@ public static class Pdf417BitStreamParser
                     case TextMode.AlphaShift:
                         if (value < 26)
                         {
-                            Append(result, raw, (char)('A' + value));
+                            output.Append((char)('A' + value));
                         }
                         else if (value == 26)
                         {
-                            Append(result, raw, ' ');
+                            output.Append(' ');
                         }
                         else if (value == 27)
                         {
@@ -231,11 +362,11 @@ public static class Pdf417BitStreamParser
                     case TextMode.Lower:
                         if (value < 26)
                         {
-                            Append(result, raw, (char)('a' + value));
+                            output.Append((char)('a' + value));
                         }
                         else if (value == 26)
                         {
-                            Append(result, raw, ' ');
+                            output.Append(' ');
                         }
                         else if (value == 27)
                         {
@@ -257,7 +388,7 @@ public static class Pdf417BitStreamParser
                     case TextMode.Mixed:
                         if (value < MixedChars.Length)
                         {
-                            Append(result, raw, MixedChars[value]);
+                            output.Append(MixedChars[value]);
                         }
                         else if (value == 25)
                         {
@@ -265,7 +396,7 @@ public static class Pdf417BitStreamParser
                         }
                         else if (value == 26)
                         {
-                            Append(result, raw, ' ');
+                            output.Append(' ');
                         }
                         else if (value == 27)
                         {
@@ -286,7 +417,7 @@ public static class Pdf417BitStreamParser
                     case TextMode.Punctuation:
                         if (value < PunctuationChars.Length)
                         {
-                            Append(result, raw, PunctuationChars[value]);
+                            output.Append(PunctuationChars[value]);
                         }
                         else if (value == 29)
                         {
@@ -298,7 +429,7 @@ public static class Pdf417BitStreamParser
                     case TextMode.PunctuationShift:
                         if (value < PunctuationChars.Length)
                         {
-                            Append(result, raw, PunctuationChars[value]);
+                            output.Append(PunctuationChars[value]);
                         }
                         else if (value == 29)
                         {
@@ -315,8 +446,7 @@ public static class Pdf417BitStreamParser
         return index;
     }
 
-    private static int DecodeBytes(
-        int[] codewords, int index, int length, StringBuilder result, List<byte> raw, bool sixes)
+    private static int DecodeBytes(int[] codewords, int index, int length, Output output, bool sixes)
     {
         var group = new List<int>(5);
 
@@ -345,7 +475,7 @@ public static class Pdf417BitStreamParser
 
             for (var i = 5; i >= 0; i--)
             {
-                Append(result, raw, (char)((value >> (8 * i)) & 0xFF));
+                output.Append((byte)((value >> (8 * i)) & 0xFF));
             }
 
             group.Clear();
@@ -362,14 +492,14 @@ public static class Pdf417BitStreamParser
 
             foreach (var item in group)
             {
-                Append(result, raw, (char)(item & 0xFF));
+                output.Append((byte)(item & 0xFF));
             }
         }
 
         return index;
     }
 
-    private static int DecodeNumeric(int[] codewords, int index, int length, StringBuilder result, List<byte> raw)
+    private static int DecodeNumeric(int[] codewords, int index, int length, Output output)
     {
         var group = new List<int>(15);
 
@@ -386,7 +516,7 @@ public static class Pdf417BitStreamParser
 
             if (group.Count == 15)
             {
-                if (!EmitNumericGroup(group, result, raw))
+                if (!EmitNumericGroup(group, output))
                 {
                     return -1;
                 }
@@ -395,7 +525,7 @@ public static class Pdf417BitStreamParser
             }
         }
 
-        if (group.Count > 0 && !EmitNumericGroup(group, result, raw))
+        if (group.Count > 0 && !EmitNumericGroup(group, output))
         {
             return -1;
         }
@@ -410,7 +540,7 @@ public static class Pdf417BitStreamParser
     /// The encoder prefixes the digits with a 1 so that leading zeros survive the conversion to a
     /// number, so that digit is dropped again here.
     /// </remarks>
-    private static bool EmitNumericGroup(List<int> group, StringBuilder result, List<byte> raw)
+    private static bool EmitNumericGroup(List<int> group, Output output)
     {
         BigInteger value = 0;
         foreach (var codeword in group)
@@ -426,43 +556,89 @@ public static class Pdf417BitStreamParser
 
         foreach (var digit in digits.AsSpan(1))
         {
-            Append(result, raw, digit);
+            output.Append(digit);
         }
 
         return true;
     }
 
+    /// <summary>
+    /// Reads a Macro PDF417 control block: the segment index, the file identifier, and the
+    /// optional fields, of which only the segment count is reported.
+    /// </summary>
+    /// <remarks>
+    /// The block sits at the end of the data: a two codeword base 900 segment index, the file
+    /// identifier as text compaction codewords, then optional fields each introduced by 923 and
+    /// a field designator, and finally 922 on the last segment of the file. The segment index
+    /// and count are numeric compaction values, so their digits carry the leading 1 that keeps
+    /// zeros intact.
+    /// </remarks>
     private static int DecodeMacro(int[] codewords, int index, int length, ref int? segmentIndex, ref int? segmentCount)
     {
-        // The control block starts with a five codeword numeric segment index.
-        if (index + 5 > length)
+        if (index + 2 > length)
         {
             return length;
         }
 
-        BigInteger value = 0;
-        for (var i = 0; i < 5; i++)
+        if (!TryReadMacroNumber(codewords.AsSpan(index, 2), out var parsedIndex))
         {
-            value = (value * 900) + codewords[index + i];
+            return -1;
         }
 
-        var digits = value.ToString(CultureInfo.InvariantCulture);
-        if (digits.Length > 1 && digits[0] == '1' && int.TryParse(digits.AsSpan(1), out var parsed))
+        segmentIndex = parsedIndex;
+        index += 2;
+
+        // The file identifier: text compaction codewords up to the first optional field or the
+        // terminator. It names the file, not the payload, so it is skipped.
+        while (index < length && codewords[index] < TextCompaction)
         {
-            segmentIndex = parsed;
+            index++;
         }
 
-        index += 5;
+        while (index < length && codewords[index] == MacroOptionalField)
+        {
+            index++;
+            if (index >= length)
+            {
+                return length;
+            }
 
-        // The file identifier and optional fields follow; they are metadata, not payload, so the
-        // remainder of the stream is skipped.
-        _ = segmentCount;
-        return length;
+            var designator = codewords[index++];
+            var fieldStart = index;
+            while (index < length && codewords[index] < TextCompaction)
+            {
+                index++;
+            }
+
+            // Field 1 is the segment count; the others (file name, time stamp, sender,
+            // addressee, file size, checksum) are metadata this library does not surface.
+            if (designator == 1 && index - fieldStart >= 2 &&
+                TryReadMacroNumber(codewords.AsSpan(fieldStart, 2), out var parsedCount))
+            {
+                segmentCount = parsedCount;
+            }
+        }
+
+        if (index < length && codewords[index] == MacroTerminator)
+        {
+            index++;
+        }
+
+        return index;
     }
 
-    private static void Append(StringBuilder result, List<byte> raw, char value)
+    /// <summary>Reads a two codeword numeric compaction value: base 900 digits with a leading 1.</summary>
+    private static bool TryReadMacroNumber(ReadOnlySpan<int> codewords, out int value)
     {
-        result.Append(value);
-        raw.Add((byte)value);
+        value = 0;
+        if (codewords.Length != 2 || codewords[0] >= TextCompaction || codewords[1] >= TextCompaction)
+        {
+            return false;
+        }
+
+        var number = (codewords[0] * 900) + codewords[1];
+        var digits = number.ToString(CultureInfo.InvariantCulture);
+        return digits.Length > 1 && digits[0] == '1' && int.TryParse(digits.AsSpan(1), NumberStyles.None, CultureInfo.InvariantCulture, out value);
     }
+
 }

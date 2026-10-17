@@ -430,10 +430,12 @@ public static class QrBitStreamParser
             return false;
         }
 
-        // Kanji and Hanzi segments are packed as two byte codes in Shift JIS or GB2312. Those
-        // code pages are not part of the trimmed base class library, so the bytes are recovered
-        // exactly into the raw payload and rendered into the text with the replacement
-        // character; an application that needs them can re-decode RawBytes with its own provider.
+        // Kanji and Hanzi segments are packed as two byte codes in Shift JIS or GB 2312. Those
+        // code pages are not part of the trimmed base class library, so the bytes are always
+        // recovered exactly into the raw payload; the text gets the characters when the host
+        // application has registered a code page provider, and the replacement character
+        // otherwise, so that RawBytes can still be re-decoded.
+        var start = raw.Count;
         for (var i = 0; i < count; i++)
         {
             var twoBytes = bits.ReadBits(13);
@@ -449,7 +451,16 @@ public static class QrBitStreamParser
 
             raw.Add((byte)(assembled >> 8));
             raw.Add((byte)(assembled & 0xFF));
-            text.Append('�');
+        }
+
+        var encoding = kanji ? CharacterSetEci.ShiftJis : CharacterSetEci.Gb2312;
+        if (encoding is null)
+        {
+            text.Append('�', count);
+        }
+        else
+        {
+            text.Append(encoding.GetString(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(raw)[start..]));
         }
 
         return true;

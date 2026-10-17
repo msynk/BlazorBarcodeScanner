@@ -23,7 +23,7 @@
         <tr><td class="mono">Facing</td><td class="mono">CameraFacing</td><td class="mono">Rear</td><td>Preferred camera when no device id is given.</td></tr>
         <tr><td class="mono">DeviceId</td><td class="mono">string?</td><td class="mono">null</td><td>A specific camera to open.</td></tr>
         <tr><td class="mono">AutoStart</td><td class="mono">bool</td><td class="mono">true</td><td>Open the camera as soon as the component is ready.</td></tr>
-        <tr><td class="mono">DuplicateSuppressionWindow</td><td class="mono">TimeSpan</td><td class="mono">2s</td><td>How long an identical value stays suppressed.</td></tr>
+        <tr><td class="mono">DuplicateSuppressionWindow</td><td class="mono">TimeSpan?</td><td class="mono">null (2s)</td><td>How long an identical value stays suppressed. Set, it overrides <code>Options</code>; unset, <code>Options</code> decides, else 2 s.</td></tr>
         <tr><td class="mono">ShowControls</td><td class="mono">bool</td><td class="mono">true</td><td>Built-in control bar.</td></tr>
         <tr><td class="mono">ShowStatusBar</td><td class="mono">bool</td><td class="mono">true</td><td>Built-in status bar.</td></tr>
         <tr><td class="mono">ShowReticle</td><td class="mono">bool</td><td class="mono">true</td><td>Corner reticle over the scan region.</td></tr>

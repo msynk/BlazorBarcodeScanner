@@ -388,8 +388,15 @@ public sealed class EanUpcReader : IRowDecoder
             return false;
         }
 
-        // The symbol must be followed by a quiet zone at least as wide as the end guard itself.
-        var quietEnd = end + (end - rowOffset);
+        // The symbol must be followed by a quiet zone at least as wide as the end guard itself,
+        // and for UPC-E the seven modules its specification demands: the middle guard of an
+        // EAN-13 followed by the first bar of its seventh digit is the same six elements as a
+        // UPC-E end guard, so a damaged EAN-13 is otherwise a UPC-E candidate.
+        var guardWidth = end - rowOffset;
+        var quietWidth = pattern.Length == UpcEEndPattern.Length
+            ? (int)MathF.Ceiling(guardWidth * 7f / pattern.Length)
+            : guardWidth;
+        var quietEnd = end + quietWidth;
         if (quietEnd > row.Size || !row.IsRange(end, quietEnd, false))
         {
             return false;

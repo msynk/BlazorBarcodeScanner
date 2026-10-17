@@ -90,7 +90,7 @@ public sealed class ScannerAppFixture : IAsyncLifetime
         {
             ArgumentList =
             {
-                "run", "--project", demo, "-c", "Release", "--no-build", "--no-launch-profile",
+                "run", "--project", demo, "-c", BuildConfiguration, "--no-build", "--no-launch-profile",
                 "--urls", BaseUrl,
             },
             RedirectStandardOutput = true,
@@ -116,6 +116,10 @@ public sealed class ScannerAppFixture : IAsyncLifetime
             "--use-fake-device-for-media-stream",
             $"--use-file-for-fake-video-capture={clipPath ?? RotatingClip}",
             "--autoplay-policy=no-user-gesture-required",
+
+            // Exposes window.gc so a heap measurement can collect first; without it the figure
+            // is whatever garbage V8 has not got round to yet, which is not a leak.
+            "--js-flags=--expose-gc",
         };
 
         if (grantPermission)
@@ -176,12 +180,24 @@ public sealed class ScannerAppFixture : IAsyncLifetime
         return null;
     }
 
+    /// <summary>
+    /// The configuration this test assembly was built in. The demo is a project reference, so it
+    /// was built in the same configuration, and <c>--no-build</c> has to run that build rather
+    /// than a Release one that may not exist.
+    /// </summary>
+    private const string BuildConfiguration =
+#if DEBUG
+        "Debug";
+#else
+        "Release";
+#endif
+
     private static string? LocateDemoProject()
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
         while (directory is not null)
         {
-            var candidate = Path.Combine(directory.FullName, "src", "BlazorBarcodeScanner.Demo", "BlazorBarcodeScanner.Demo.csproj");
+            var candidate = Path.Combine(directory.FullName, "Demo", "BlazorBarcodeScanner.Demo.csproj");
             if (File.Exists(candidate))
             {
                 return candidate;

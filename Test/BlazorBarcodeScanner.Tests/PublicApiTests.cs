@@ -11,6 +11,7 @@ namespace BlazorBarcodeScanner.Tests;
 /// filter, the reported geometry, and the promise that a frame that finds nothing allocates
 /// nothing.
 /// </summary>
+[Collection(AllocationSensitiveCollection.Name)]
 public class PublicApiTests
 {
     private static LuminanceBuffer Qr(string content = "API") =>
@@ -212,6 +213,28 @@ public class PublicApiTests
         Assert.NotNull(result);
         Assert.True(result.BoundingBox.X >= 380, $"Expected the box near x=400, got {result.BoundingBox}.");
         Assert.True(result.BoundingBox.Y >= 280, $"Expected the box near y=300, got {result.BoundingBox}.");
+    }
+
+    [Theory]
+    [InlineData(1.0, 0.0, 0.5, 0.5)]
+    [InlineData(0.0, 1.0, 0.5, 0.5)]
+    [InlineData(0.5, 0.5, 0.0, 0.0)]
+    [InlineData(0.999, 0.999, 1.0, 1.0)]
+    public void ADegenerateRegionYieldsNoSymbolRatherThanAnException(double x, double y, double w, double h)
+    {
+        // A region on the far edge of the frame, or one with no area, is a configuration a
+        // caller can reach by arithmetic; the frame loop must survive it.
+        using var qr = Qr("EDGE");
+        using var frame = ImageTransforms.Frame(qr, 320, 240);
+
+        using var decoder = new BarcodeDecoder(new ScannerOptions
+        {
+            Region = new ScanRegion(x, y, w, h),
+            DuplicateSuppressionWindow = TimeSpan.Zero,
+        });
+
+        Assert.Null(decoder.Decode(frame.View, suppressDuplicates: false));
+        Assert.Equal(1, decoder.FramesDecoded);
     }
 
     [Fact]

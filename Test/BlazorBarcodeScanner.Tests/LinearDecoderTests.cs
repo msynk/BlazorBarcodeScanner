@@ -1,6 +1,7 @@
 using BlazorBarcodeScanner.Decoding;
 using BlazorBarcodeScanner.Decoding.OneD;
 using BlazorBarcodeScanner.Imaging;
+using BlazorBarcodeScanner.Pipeline;
 using BlazorBarcodeScanner.TestKit;
 using Xunit;
 
@@ -118,6 +119,24 @@ public class LinearDecoderTests
         Assert.NotNull(result);
         Assert.Equal(BarcodeFormat.Itf, result.Format);
         Assert.Equal(digits, result.Payload.Text);
+    }
+
+    [Theory]
+    [InlineData("!R")]
+    [InlineData("0050")]
+    public void Code128CheckCharacterOfValue102IsNotReportedAsAGroupSeparator(string content)
+    {
+        // These contents have a modulo 103 check character of 102, the value of FNC1. The check
+        // character is never data, so nothing may be appended for it.
+        var modules = LinearEncoders.Code128(content);
+        using var image = SyntheticImage.FromLinear(modules, scale: 3, height: 40);
+
+        using var decoder = new BarcodeDecoder(new ScannerOptions { Formats = BarcodeFormat.Code128, DuplicateSuppressionWindow = TimeSpan.Zero });
+        var result = decoder.Decode(image.View, suppressDuplicates: false);
+
+        Assert.NotNull(result);
+        Assert.Equal(content, result.Text);
+        Assert.DoesNotContain((char)29, result.Text);
     }
 
     [Fact]

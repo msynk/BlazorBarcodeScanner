@@ -25,6 +25,33 @@ public static class DataMatrixEncoder
         var version = ChooseVersion(codewords.Count, minimumVersion)
             ?? throw new ArgumentException("The content does not fit in any Data Matrix symbol.", nameof(content));
 
+        return Build(codewords, version);
+    }
+
+    /// <summary>
+    /// Encodes text into one specific symbol shape, square or rectangular. <see cref="Encode"/>
+    /// only ever picks a square shape, so this is how the rectangular ones are reached.
+    /// </summary>
+    /// <param name="content">The text to encode; ISO-8859-1 characters only.</param>
+    /// <param name="version">The shape to produce.</param>
+    public static BitMatrix Encode(string content, DataMatrixVersion version)
+    {
+        ArgumentNullException.ThrowIfNull(content);
+        ArgumentNullException.ThrowIfNull(version);
+
+        var codewords = EncodeAscii(content);
+        if (codewords.Count > version.TotalDataCodewords)
+        {
+            throw new ArgumentException(
+                $"The content needs {codewords.Count} data codewords; {version} holds {version.TotalDataCodewords}.",
+                nameof(content));
+        }
+
+        return Build(codewords, version);
+    }
+
+    private static BitMatrix Build(List<byte> codewords, DataMatrixVersion version)
+    {
         AddPadding(codewords, version.TotalDataCodewords);
 
         var raw = InterleaveWithEcCodewords([.. codewords], version);

@@ -18,17 +18,80 @@ namespace BlazorBarcodeScanner.Decoding.QrCode;
 /// third of the smallest readable finder pattern and drops once a first candidate is confirmed,
 /// so a frame containing no symbol costs a fraction of a frame that contains one.
 /// </para>
+/// <para>
+/// The data region of a large symbol is full of 1:1:3:1:1 coincidences, and some of them survive
+/// every cross-check. The scan therefore only stops early once three confirmed centres also sit
+/// where the corners of a symbol could sit, and the triples that come out are ranked so that a
+/// caller can fall back to the next one when the first does not sample into a readable grid.
+/// </para>
 /// </remarks>
 public sealed class QrFinderPatternFinder
 {
     private const int MinSkip = 3;
     private const int MaxModules = 97;
 
+    /// <summary>How many ranked triples are kept; the rest are discarded.</summary>
+    public const int MaxCandidates = 4;
+
+    /// <summary>
+    /// The centres of a version 1 symbol are fourteen modules apart along each edge, so no two
+    /// finder patterns of one symbol can be closer than that.
+    /// </summary>
+    private const float MinCenterSpacingModules = 14.0f;
+
+    /// <summary>
+    /// The largest distortion, relative to the squared longest side, at which three confirmed
+    /// centres are trusted enough to stop the scan. Rendered symbols score close to zero; a
+    /// corner placed on a lattice coincidence scores around 0.4 and up.
+    /// </summary>
+    private const float MaxEarlyStopDistortion = 0.25f;
+
+    /// <summary>
+    /// The smallest triangle area, as a fraction of the squared longest side, that is not
+    /// treated as three collinear points. A right isosceles triangle scores 0.5.
+    /// </summary>
+    private const float MinTriangleArea = 0.05f;
+
+    private static readonly Comparison<QrFinderPattern> ByModuleSize =
+        static (a, b) => a.EstimatedModuleSize.CompareTo(b.EstimatedModuleSize);
+
     private readonly List<QrFinderPattern> _possibleCenters = new(8);
     private readonly int[] _crossCheckStateCount = new int[5];
+    private readonly Triple[] _candidates = new Triple[MaxCandidates];
 
     private BitMatrix? _image;
     private bool _hasSkipped;
+    private int _candidateCount;
+
+    /// <summary>
+    /// Three finder patterns that could be the corners of one symbol, already in the order the
+    /// perspective transform expects.
+    /// </summary>
+    public readonly struct Triple
+    {
+        internal Triple(QrFinderPattern bottomLeft, QrFinderPattern topLeft, QrFinderPattern topRight, float distortion)
+        {
+            BottomLeft = bottomLeft;
+            TopLeft = topLeft;
+            TopRight = topRight;
+            Distortion = distortion;
+        }
+
+        /// <summary>The pattern below the top-left one.</summary>
+        public QrFinderPattern BottomLeft { get; }
+
+        /// <summary>The pattern at the right-angled corner.</summary>
+        public QrFinderPattern TopLeft { get; }
+
+        /// <summary>The pattern to the right of the top-left one.</summary>
+        public QrFinderPattern TopRight { get; }
+
+        /// <summary>
+        /// How far the triangle departs from an isosceles right triangle, in squared pixels;
+        /// zero is a perfect, upright symbol and smaller is more likely.
+        /// </summary>
+        public float Distortion { get; }
+    }
 
     /// <summary>Creates a finder without an image; call <see cref="Reset"/> before searching.</summary>
     public QrFinderPatternFinder()
@@ -54,10 +117,11 @@ public sealed class QrFinderPatternFinder
         _image = image;
         _possibleCenters.Clear();
         _hasSkipped = false;
+        _candidateCount = 0;
     }
 
     /// <summary>
-    /// Searches for three finder patterns.
+    /// Searches for three finder patterns and returns the most likely triple.
     /// </summary>
     /// <param name="tryHarder">When <see langword="true"/> every row is scanned instead of a strided subset.</param>
     /// <param name="patterns">
@@ -66,10 +130,40 @@ public sealed class QrFinderPatternFinder
     /// </param>
     public bool TryFind(bool tryHarder, out QrFinderPattern[] patterns)
     {
-        patterns = [];
+        var candidates = FindCandidates(tryHarder);
+        if (candidates.IsEmpty)
+        {
+            patterns = [];
+            return false;
+        }
+
+        var best = candidates[0];
+        patterns = [best.BottomLeft, best.TopLeft, best.TopRight];
+        return true;
+    }
+
+    /// <summary>
+    /// Searches for finder patterns and returns every plausible triple, most likely first.
+    /// </summary>
+    /// <remarks>
+    /// The span is a view over scratch storage owned by this finder and is only valid until the
+    /// next search or <see cref="Reset"/>. At most <see cref="MaxCandidates"/> triples are kept.
+    /// </remarks>
+    /// <param name="tryHarder">When <see langword="true"/> every row is scanned instead of a strided subset.</param>
+    public ReadOnlySpan<Triple> FindCandidates(bool tryHarder)
+    {
         _possibleCenters.Clear();
         _hasSkipped = false;
+        _candidateCount = 0;
 
+        Scan(tryHarder);
+        RankCandidates();
+
+        return _candidates.AsSpan(0, _candidateCount);
+    }
+
+    private void Scan(bool tryHarder)
+    {
         var maxI = _image!.Height;
         var maxJ = _image!.Width;
 
@@ -157,8 +251,6 @@ public sealed class QrFinderPatternFinder
                 done = HaveMultiplyConfirmedCenters();
             }
         }
-
-        return TrySelectBestPatterns(out patterns);
     }
 
     /// <summary>Checks the 1:1:3:1:1 ratio that a line through a finder pattern produces.</summary>
@@ -510,11 +602,20 @@ public sealed class QrFinderPatternFinder
         return 0;
     }
 
+    /// <summary>
+    /// Decides whether the scan can stop: three confirmed centres whose module sizes agree and
+    /// which are laid out like the corners of a symbol.
+    /// </summary>
+    /// <remarks>
+    /// Agreement in module size alone is not enough. The padding region of a large symbol holds
+    /// lattices of 1:1:3:1:1 coincidences that pass every cross-check and get confirmed once the
+    /// row stride drops to two, and three of those, or two real corners plus one of those, would
+    /// otherwise end the scan before it reaches the real third corner.
+    /// </remarks>
     private bool HaveMultiplyConfirmedCenters()
     {
         var confirmedCount = 0;
         var totalModuleSize = 0.0f;
-        var max = _possibleCenters.Count;
 
         foreach (var pattern in _possibleCenters)
         {
@@ -534,36 +635,140 @@ public sealed class QrFinderPatternFinder
 
         // Three confirmed centres are only trustworthy when their module sizes agree; a large
         // spread means at least one of them belongs to something that is not this symbol.
-        var average = totalModuleSize / max;
+        var average = totalModuleSize / confirmedCount;
         var totalDeviation = 0.0f;
         foreach (var pattern in _possibleCenters)
         {
-            totalDeviation += Math.Abs(pattern.EstimatedModuleSize - average);
+            if (pattern.Count >= 2)
+            {
+                totalDeviation += Math.Abs(pattern.EstimatedModuleSize - average);
+            }
         }
 
-        return totalDeviation <= 0.05f * totalModuleSize;
-    }
-
-    private bool TrySelectBestPatterns(out QrFinderPattern[] patterns)
-    {
-        patterns = [];
-        var count = _possibleCenters.Count;
-        if (count < 3)
+        if (totalDeviation > 0.05f * totalModuleSize)
         {
             return false;
         }
 
-        if (count == 3)
+        var count = _possibleCenters.Count;
+        for (var i = 0; i < count - 2; i++)
         {
-            patterns = [_possibleCenters[0], _possibleCenters[1], _possibleCenters[2]];
-            OrderBestPatterns(patterns);
-            return true;
+            var fpi = _possibleCenters[i];
+            if (fpi.Count < 2)
+            {
+                continue;
+            }
+
+            for (var j = i + 1; j < count - 1; j++)
+            {
+                var fpj = _possibleCenters[j];
+                if (fpj.Count < 2)
+                {
+                    continue;
+                }
+
+                for (var k = j + 1; k < count; k++)
+                {
+                    var fpk = _possibleCenters[k];
+                    if (fpk.Count < 2)
+                    {
+                        continue;
+                    }
+
+                    var minModuleSize = Math.Min(fpi.EstimatedModuleSize, Math.Min(fpj.EstimatedModuleSize, fpk.EstimatedModuleSize));
+                    if (TryMeasure(fpi, fpj, fpk, minModuleSize, out var distortion, out var longestSideSquared) &&
+                        distortion <= MaxEarlyStopDistortion * longestSideSquared &&
+                        ImpliesLegalDimension(fpi, fpj, fpk) &&
+                        HasSolidCenter(fpi) && HasSolidCenter(fpj) && HasSolidCenter(fpk))
+                    {
+                        return true;
+                    }
+                }
+            }
         }
 
-        _possibleCenters.Sort(static (a, b) => a.EstimatedModuleSize.CompareTo(b.EstimatedModuleSize));
+        return false;
+    }
 
-        var bestDistortion = double.MaxValue;
-        QrFinderPattern[]? best = null;
+    /// <summary>
+    /// Checks that a candidate still shows the 1:1:3:1:1 ratio one module off its centre, both
+    /// horizontally and vertically.
+    /// </summary>
+    /// <remarks>
+    /// The cross-checks that admit a candidate all pass through its centre, and a plus-shaped
+    /// coincidence in a data region satisfies every one of them. A real finder pattern has a
+    /// solid three by three module centre, so the ratio also holds on the lines a module away,
+    /// where such a coincidence falls apart. This is only consulted before stopping the scan
+    /// early: a blurred or damaged corner that fails it still gets found by the full scan.
+    /// </remarks>
+    private bool HasSolidCenter(QrFinderPattern pattern)
+    {
+        var moduleSize = pattern.EstimatedModuleSize;
+        var maxCount = MathUtils.Round(3.0f * moduleSize);
+        var total = MathUtils.Round(7.0f * moduleSize);
+        var centerX = (int)pattern.X;
+        var centerY = (int)pattern.Y;
+        var offset = Math.Max(1, (int)moduleSize);
+
+        return IsInside(centerX, centerY - offset) && IsInside(centerX, centerY + offset)
+            && IsInside(centerX - offset, centerY) && IsInside(centerX + offset, centerY)
+            && !float.IsNaN(CrossCheckHorizontal(centerX, centerY - offset, maxCount, total))
+            && !float.IsNaN(CrossCheckHorizontal(centerX, centerY + offset, maxCount, total))
+            && !float.IsNaN(CrossCheckVertical(centerY, centerX - offset, maxCount, total))
+            && !float.IsNaN(CrossCheckVertical(centerY, centerX + offset, maxCount, total));
+    }
+
+    private bool IsInside(int x, int y) =>
+        (uint)x < (uint)_image!.Width && (uint)y < (uint)_image!.Height;
+
+    /// <summary>
+    /// Checks that the spacing of three centres, in their own modules, is one a QR version has.
+    /// </summary>
+    /// <remarks>
+    /// A lattice of coincidences inside a symbol's data region can form a perfect right isosceles
+    /// triangle, but its spacing follows the codeword layout rather than a symbol size: twelve
+    /// modules implies a nineteen module symbol, which does not exist. The rule mirrors the
+    /// detector's: a legal dimension is one more than a multiple of four, and an estimate one
+    /// module off is snapped rather than rejected, since the module size here is only an
+    /// estimate from the finder patterns themselves.
+    /// </remarks>
+    private static bool ImpliesLegalDimension(QrFinderPattern a, QrFinderPattern b, QrFinderPattern c)
+    {
+        Order(a, b, c, out var bottomLeft, out var topLeft, out var topRight);
+
+        var moduleSize = (a.EstimatedModuleSize + b.EstimatedModuleSize + c.EstimatedModuleSize) / 3.0f;
+        var topEdge = MathUtils.Round(MathUtils.Distance(topLeft.X, topLeft.Y, topRight.X, topRight.Y) / moduleSize);
+        var leftEdge = MathUtils.Round(MathUtils.Distance(topLeft.X, topLeft.Y, bottomLeft.X, bottomLeft.Y) / moduleSize);
+        var dimension = ((topEdge + leftEdge) / 2) + 7;
+
+        switch (dimension & 0x03)
+        {
+            case 0:
+                dimension++;
+                break;
+            case 2:
+                dimension--;
+                break;
+            case 3:
+                return false;
+        }
+
+        return dimension is >= 21 and <= 177;
+    }
+
+    /// <summary>
+    /// Ranks every plausible triple of candidates by distortion and keeps the best few.
+    /// </summary>
+    private void RankCandidates()
+    {
+        _candidateCount = 0;
+        var count = _possibleCenters.Count;
+        if (count < 3)
+        {
+            return;
+        }
+
+        _possibleCenters.Sort(ByModuleSize);
 
         for (var i = 0; i < count - 2; i++)
         {
@@ -573,42 +778,113 @@ public sealed class QrFinderPatternFinder
             for (var j = i + 1; j < count - 1; j++)
             {
                 var fpj = _possibleCenters[j];
-                var squares0 = SquaredDistance(fpi, fpj);
 
                 for (var k = j + 1; k < count; k++)
                 {
                     var fpk = _possibleCenters[k];
+
+                    // The list is sorted by module size, so once one is too large the rest are.
                     if (fpk.EstimatedModuleSize > minModuleSize * 1.4f)
                     {
-                        continue;
+                        break;
                     }
 
-                    // The three centres of a QR symbol form an isosceles right triangle, so the
-                    // longest side squared should be twice each of the others.
-                    Span<double> sides = [squares0, SquaredDistance(fpj, fpk), SquaredDistance(fpi, fpk)];
-                    sides.Sort();
-
-                    var distortion = Math.Abs(sides[2] - (2 * sides[1])) + Math.Abs(sides[2] - (2 * sides[0]));
-                    if (distortion < bestDistortion)
+                    if (TryMeasure(fpi, fpj, fpk, minModuleSize, out var distortion, out _))
                     {
-                        bestDistortion = distortion;
-                        best = [fpi, fpj, fpk];
+                        InsertCandidate(fpi, fpj, fpk, distortion);
                     }
                 }
             }
         }
+    }
 
-        if (best is null)
+    /// <summary>Inserts a triple into the ranked candidates, dropping the worst once full.</summary>
+    private void InsertCandidate(QrFinderPattern a, QrFinderPattern b, QrFinderPattern c, float distortion)
+    {
+        var position = _candidateCount;
+        while (position > 0 && _candidates[position - 1].Distortion > distortion)
+        {
+            position--;
+        }
+
+        if (position >= MaxCandidates)
+        {
+            return;
+        }
+
+        var last = Math.Min(_candidateCount, MaxCandidates - 1);
+        for (var m = last; m > position; m--)
+        {
+            _candidates[m] = _candidates[m - 1];
+        }
+
+        Order(a, b, c, out var bottomLeft, out var topLeft, out var topRight);
+        _candidates[position] = new Triple(bottomLeft, topLeft, topRight, distortion);
+
+        if (_candidateCount < MaxCandidates)
+        {
+            _candidateCount++;
+        }
+    }
+
+    /// <summary>
+    /// Measures how well three centres fit the corners of one symbol.
+    /// </summary>
+    /// <remarks>
+    /// The three centres of a QR symbol form an isosceles right triangle, so the longest side
+    /// squared should be twice each of the others; the distortion is how far it is from that.
+    /// Two things disqualify a triple outright: a longest side shorter than the centre spacing
+    /// of the smallest symbol, and three centres in a line, which no corner set can be.
+    /// </remarks>
+    /// <returns><see langword="false"/> when the triple cannot be three corners of one symbol.</returns>
+    private static bool TryMeasure(
+        QrFinderPattern a,
+        QrFinderPattern b,
+        QrFinderPattern c,
+        float minModuleSize,
+        out float distortion,
+        out float longestSideSquared)
+    {
+        var ab = SquaredDistance(a, b);
+        var bc = SquaredDistance(b, c);
+        var ac = SquaredDistance(a, c);
+
+        // Sort the three sides without touching the heap.
+        if (ab > bc)
+        {
+            (ab, bc) = (bc, ab);
+        }
+
+        if (bc > ac)
+        {
+            (bc, ac) = (ac, bc);
+        }
+
+        if (ab > bc)
+        {
+            (ab, bc) = (bc, ab);
+        }
+
+        longestSideSquared = ac;
+        distortion = 0.0f;
+
+        var minSpacing = MinCenterSpacingModules * minModuleSize;
+        if (longestSideSquared < minSpacing * minSpacing)
         {
             return false;
         }
 
-        OrderBestPatterns(best);
-        patterns = best;
+        // The cross product is twice the triangle's area; near zero means collinear.
+        if (Math.Abs(CrossProductZ(a, b, c)) < MinTriangleArea * longestSideSquared)
+        {
+            return false;
+        }
+
+        distortion = Math.Abs(longestSideSquared - (2 * bc)) + Math.Abs(longestSideSquared - (2 * ab));
         return true;
     }
 
-    private static double SquaredDistance(QrFinderPattern a, QrFinderPattern b) =>
+    private static float SquaredDistance(QrFinderPattern a, QrFinderPattern b) =>
         MathUtils.DistanceSquared(a.X, a.Y, b.X, b.Y);
 
     /// <summary>
@@ -619,29 +895,43 @@ public sealed class QrFinderPatternFinder
     {
         ArgumentNullException.ThrowIfNull(patterns);
 
-        var zeroOne = MathUtils.Distance(patterns[0].X, patterns[0].Y, patterns[1].X, patterns[1].Y);
-        var oneTwo = MathUtils.Distance(patterns[1].X, patterns[1].Y, patterns[2].X, patterns[2].Y);
-        var zeroTwo = MathUtils.Distance(patterns[0].X, patterns[0].Y, patterns[2].X, patterns[2].Y);
+        Order(patterns[0], patterns[1], patterns[2], out var bottomLeft, out var topLeft, out var topRight);
+        patterns[0] = bottomLeft;
+        patterns[1] = topLeft;
+        patterns[2] = topRight;
+    }
+
+    private static void Order(
+        QrFinderPattern first,
+        QrFinderPattern second,
+        QrFinderPattern third,
+        out QrFinderPattern bottomLeft,
+        out QrFinderPattern topLeft,
+        out QrFinderPattern topRight)
+    {
+        var zeroOne = MathUtils.Distance(first.X, first.Y, second.X, second.Y);
+        var oneTwo = MathUtils.Distance(second.X, second.Y, third.X, third.Y);
+        var zeroTwo = MathUtils.Distance(first.X, first.Y, third.X, third.Y);
 
         // The pattern opposite the longest side is the corner one: the top-left.
         QrFinderPattern pointA, pointB, pointC;
         if (oneTwo >= zeroOne && oneTwo >= zeroTwo)
         {
-            pointB = patterns[0];
-            pointA = patterns[1];
-            pointC = patterns[2];
+            pointB = first;
+            pointA = second;
+            pointC = third;
         }
         else if (zeroTwo >= oneTwo && zeroTwo >= zeroOne)
         {
-            pointB = patterns[1];
-            pointA = patterns[0];
-            pointC = patterns[2];
+            pointB = second;
+            pointA = first;
+            pointC = third;
         }
         else
         {
-            pointB = patterns[2];
-            pointA = patterns[0];
-            pointC = patterns[1];
+            pointB = third;
+            pointA = first;
+            pointC = second;
         }
 
         // The sign of the cross product says whether A and C are the right way round.
@@ -650,9 +940,9 @@ public sealed class QrFinderPatternFinder
             (pointA, pointC) = (pointC, pointA);
         }
 
-        patterns[0] = pointA;
-        patterns[1] = pointB;
-        patterns[2] = pointC;
+        bottomLeft = pointA;
+        topLeft = pointB;
+        topRight = pointC;
     }
 
     private static float CrossProductZ(QrFinderPattern a, QrFinderPattern b, QrFinderPattern c) =>

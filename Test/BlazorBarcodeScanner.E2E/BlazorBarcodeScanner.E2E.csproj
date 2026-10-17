@@ -15,7 +15,7 @@
 
   <ItemGroup>
     <ProjectReference Include="../BlazorBarcodeScanner.TestKit/BlazorBarcodeScanner.TestKit.csproj" />
-    <ProjectReference Include="../../BlazorBarcodeScanner.Demo/BlazorBarcodeScanner.Demo.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="../../Demo/BlazorBarcodeScanner.Demo.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

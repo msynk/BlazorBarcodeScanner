@@ -336,8 +336,10 @@ public sealed class Code128Reader : IRowDecoder
             return null;
         }
 
-        if (quietStart >= row.Size ||
-            !row.IsRange(quietStart, Math.Min(row.Size, quietStart + ((quietStart - lastStart) / 2)), false))
+        // The quiet zone has to lie inside the frame: a symbol cut off by the edge of the image
+        // may be missing characters, and the check character alone is a one in a hundred guard.
+        var quietEnd = quietStart + ((quietStart - lastStart) / 2);
+        if (quietEnd > row.Size || !row.IsRange(quietStart, quietEnd, false))
         {
             return null;
         }
@@ -359,6 +361,13 @@ public sealed class Code128Reader : IRowDecoder
             }
 
             result.Length -= checkCharacterLength;
+        }
+        else if (lastCode == CodeFnc1 && result.Length > 0 && result[^1] == (char)29)
+        {
+            // A check character of value 102 went through the FNC1 branch and appended a group
+            // separator; the check character is never data, so that has to come out too. The
+            // other function codes leave nothing behind once the symbol has ended.
+            result.Length--;
         }
 
         if (result.Length == 0)
@@ -417,8 +426,11 @@ public sealed class Code128Reader : IRowDecoder
                     }
                 }
 
-                // Require a quiet zone of at least half the start pattern width before the symbol.
-                if (bestMatch >= 0 && row.IsRange(Math.Max(0, start - ((i - start) / 2)), start, false))
+                // Require a quiet zone of at least half the start pattern width before the symbol,
+                // and require it to lie inside the frame: a start pattern flush against the edge
+                // of the image is as likely to be the middle of a cropped symbol as its start.
+                var quietStart = start - ((i - start) / 2);
+                if (bestMatch >= 0 && quietStart >= 0 && row.IsRange(quietStart, start, false))
                 {
                     patternStart = start;
                     patternEnd = i;
