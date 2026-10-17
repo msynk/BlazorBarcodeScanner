@@ -13,7 +13,7 @@
 
   <ItemGroup>
     <ProjectReference Include="../BlazorBarcodeScanner/BlazorBarcodeScanner.csproj" />
-    <ProjectReference Include="../tests/BlazorBarcodeScanner.TestKit/BlazorBarcodeScanner.TestKit.csproj" />
+    <ProjectReference Include="../Test/BlazorBarcodeScanner.TestKit/BlazorBarcodeScanner.TestKit.csproj" />
   </ItemGroup>
 
 </Project>
