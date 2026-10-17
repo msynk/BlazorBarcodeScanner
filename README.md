@@ -1,3 +1,5 @@
+**Note**: moved to bitplatform (https://bbscanner.bitplatform.dev)
+
 # BlazorBarcodeScanner
 
 A barcode scanner for Blazor with the decoding written from scratch in C#.
